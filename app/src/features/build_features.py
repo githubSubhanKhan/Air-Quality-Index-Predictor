@@ -32,7 +32,7 @@ def _previous_aqi(city: str, history_path: str):
     if city_history.empty:
         return None
 
-    return city_history.iloc[-1]["aqi"]
+    return city_history.iloc[-1]["aqi"].item()
 
 
 def build_feature_row(city: str, raw: dict, history_path: str) -> dict:

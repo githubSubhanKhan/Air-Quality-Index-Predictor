@@ -5,8 +5,10 @@ import pandas as pd
 
 from app.src.features.build_features import build_feature_row
 from app.src.features.fetch_waqi import fetch_city_data
+from app.src.features.feature_store import insert_feature_row
 
-# Temporary local store until the feature store (Hopsworks) is wired up in Phase 3
+# Local cache used only to look up each city's previous AQI value (for aqi_change_rate).
+# The Hopsworks feature group is the authoritative store used for training.
 HISTORY_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data", "features.csv")
 
 
@@ -22,6 +24,8 @@ def run(city: str) -> dict:
         header=not os.path.exists(history_path),
         index=False,
     )
+
+    insert_feature_row(row)
 
     return row
 
