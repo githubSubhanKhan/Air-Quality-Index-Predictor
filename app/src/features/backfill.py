@@ -8,9 +8,16 @@ from app.src.features.aqi import calculate_aqi_from_pm25
 from app.src.features.feature_store import insert_feature_row
 from app.src.features.fetch_openweather import fetch_historical_pollution, geocode_city
 from app.src.features.pipeline import HISTORY_PATH
+from app.src.features.fetch_openmeteo import fetch_historical_weather
 
 
-def _build_row(city: str, record: dict, previous_aqi) -> dict:
+def _build_row(
+        city: str,
+        record: dict,
+        previous_aqi,
+        weather_data,
+    ):
+    weather = weather_data.get(record["dt"], {})
     dt = datetime.fromtimestamp(record["dt"], tz=timezone.utc)
     components = record.get("components", {})
     pm25 = components.get("pm2_5")
@@ -31,12 +38,10 @@ def _build_row(city: str, record: dict, previous_aqi) -> dict:
         "no2": components.get("no2"),
         "so2": components.get("so2"),
         "co": components.get("co"),
-        # OpenWeather's historical air pollution endpoint has no weather data (free tier
-        # has no historical weather API); these stay unset for backfilled rows.
-        "temperature": None,
-        "humidity": None,
-        "pressure": None,
-        "wind_speed": None,
+        "temperature": weather.get("temperature"),
+        "humidity": weather.get("humidity"),
+        "pressure": weather.get("pressure"),
+        "wind_speed": weather.get("wind_speed"),
     }
 
 
@@ -45,13 +50,29 @@ def run(city: str, days: int) -> int:
 
     end = datetime.now(tz=timezone.utc)
     start = end - timedelta(days=days)
+
+    weather = fetch_historical_weather(
+        lat,
+        lon,
+        start.strftime("%Y-%m-%d"),
+        end.strftime("%Y-%m-%d"),
+    )
+
+    print(len(weather))
+
     records = fetch_historical_pollution(lat, lon, int(start.timestamp()), int(end.timestamp()))
     records.sort(key=lambda r: r["dt"])
 
     previous_aqi = None
     rows = []
     for record in records:
-        row = _build_row(city, record, previous_aqi)
+        row = _build_row(
+        city,
+        record,
+        previous_aqi,
+        weather,
+    )
+        print(record["dt"], weather.get(record["dt"]))
         previous_aqi = row["aqi"]
         rows.append(row)
         insert_feature_row(row)
