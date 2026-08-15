@@ -18,34 +18,13 @@ def _get_collection():
 
     db = _client[os.getenv("MONGODB_DB_NAME", "aqi_predictor")]
 
-    collection = db[COLLECTION_NAME]
+    return db[COLLECTION_NAME]
 
-    collection.create_index(
-        [
-            ("city", 1),
-            ("timestamp", 1),
-        ],
-        unique=True,
-    )
 
-    return collection
+def get_collection():
+    return _get_collection()
 
 
 def insert_feature_row(row: dict) -> None:
-    """
-    Insert or update a feature row.
-    Prevents duplicate city/timestamp records.
-    """
-
     collection = _get_collection()
-
-    collection.update_one(
-        {
-            "city": row["city"],
-            "timestamp": row["timestamp"],
-        },
-        {
-            "$set": dict(row),
-        },
-        upsert=True,
-    )
+    collection.insert_one(dict(row))
