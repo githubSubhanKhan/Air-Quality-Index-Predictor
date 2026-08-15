@@ -3,6 +3,8 @@ from datetime import datetime
 
 import pandas as pd
 
+from app.src.features.aqi import calculate_aqi_from_pm25
+
 # WAQI reports individual pollutant/weather readings under "iaqi", keyed like this
 IAQI_FIELDS = {
     "pm25": "pm25",
@@ -41,7 +43,13 @@ def build_feature_row(city: str, raw: dict, history_path: str) -> dict:
     dt = datetime.fromisoformat(timestamp) if timestamp else datetime.utcnow()
 
     iaqi = raw.get("iaqi", {})
-    aqi = raw.get("aqi")
+    pm25 = _iaqi_value(iaqi, "pm25")
+
+    aqi = (
+        calculate_aqi_from_pm25(pm25)
+        if pm25 is not None
+        else None
+    )
     previous_aqi = _previous_aqi(city, history_path)
 
     row = {

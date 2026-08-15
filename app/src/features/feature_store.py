@@ -12,14 +12,40 @@ _client = None
 
 def _get_collection():
     global _client
+
     if _client is None:
         _client = MongoClient(os.getenv("MONGODB_URI"))
 
     db = _client[os.getenv("MONGODB_DB_NAME", "aqi_predictor")]
-    return db[COLLECTION_NAME]
+
+    collection = db[COLLECTION_NAME]
+
+    collection.create_index(
+        [
+            ("city", 1),
+            ("timestamp", 1),
+        ],
+        unique=True,
+    )
+
+    return collection
 
 
 def insert_feature_row(row: dict) -> None:
-    """Insert one feature row (as produced by build_feature_row) into the feature store."""
+    """
+    Insert or update a feature row.
+    Prevents duplicate city/timestamp records.
+    """
+
     collection = _get_collection()
-    collection.insert_one(dict(row))
+
+    collection.update_one(
+        {
+            "city": row["city"],
+            "timestamp": row["timestamp"],
+        },
+        {
+            "$set": dict(row),
+        },
+        upsert=True,
+    )
