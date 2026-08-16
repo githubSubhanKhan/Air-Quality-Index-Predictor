@@ -2,6 +2,7 @@ import os
 
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -27,4 +28,20 @@ def get_collection():
 
 def insert_feature_row(row: dict) -> None:
     collection = _get_collection()
-    collection.insert_one(dict(row))
+
+    try:
+        collection.update_one(
+        {
+            "city": row["city"],
+            "timestamp": row["timestamp"],
+        },
+        {"$set": row},
+        upsert=True,
+    )
+        print("Inserted:", row["timestamp"])
+
+    except DuplicateKeyError:
+        print(
+            f"Duplicate skipped: "
+            f"{row['city']} - {row['timestamp']}"
+        )

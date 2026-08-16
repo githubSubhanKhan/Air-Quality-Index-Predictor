@@ -8,6 +8,10 @@ load_dotenv()
 GEOCODING_URL = "https://api.openweathermap.org/geo/1.0/direct"
 AIR_POLLUTION_HISTORY_URL = "https://api.openweathermap.org/data/2.5/air_pollution/history"
 
+CURRENT_AIR_POLLUTION_URL = (
+    "https://api.openweathermap.org/data/2.5/air_pollution"
+)
+
 
 def _api_key() -> str:
     api_key = os.getenv("OPENWEATHER_API_KEY")
@@ -43,3 +47,26 @@ def fetch_historical_pollution(lat: float, lon: float, start: int, end: int) -> 
     payload = response.json()
 
     return payload.get("list", [])
+
+def fetch_current_pollution(city: str) -> dict:
+    """
+    Fetch current pollution data for a city.
+    """
+
+    lat, lon = geocode_city(city)
+
+    response = requests.get(
+        CURRENT_AIR_POLLUTION_URL,
+        params={
+            "lat": lat,
+            "lon": lon,
+            "appid": _api_key(),
+        },
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    return payload["list"][0]

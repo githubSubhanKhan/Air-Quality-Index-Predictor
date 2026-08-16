@@ -25,4 +25,9 @@ def fetch_city_data(city: str) -> dict:
     if payload.get("status") != "ok":
         raise RuntimeError(f"WAQI API error for city '{city}': {payload}")
 
+    data = payload["data"]
+
+    print("WAQI Timestamp:", data["time"]["iso"])
+    print("WAQI AQI:", data["aqi"])
+
     return payload["data"]

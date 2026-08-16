@@ -3,8 +3,14 @@ import os
 
 import pandas as pd
 
-from app.src.features.build_features import build_feature_row
-from app.src.features.fetch_waqi import fetch_city_data
+from app.src.features.fetch_openweather import (
+    fetch_current_pollution,
+)
+
+from app.src.features.build_openweather_features import (
+    build_openweather_feature_row,
+)
+
 from app.src.features.feature_store import insert_feature_row
 
 # Local cache used only to look up each city's previous AQI value (for aqi_change_rate).
@@ -13,9 +19,13 @@ HISTORY_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data",
 
 
 def run(city: str) -> dict:
-    raw = fetch_city_data(city)
+    raw = fetch_current_pollution(city)
     history_path = os.path.abspath(HISTORY_PATH)
-    row = build_feature_row(city, raw, history_path)
+    row = build_openweather_feature_row(
+        city,
+        raw,
+        history_path,
+    )
 
     os.makedirs(os.path.dirname(history_path), exist_ok=True)
     pd.DataFrame([row]).to_csv(
