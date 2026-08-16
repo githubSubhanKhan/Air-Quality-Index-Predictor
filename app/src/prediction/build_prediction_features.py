@@ -1,6 +1,6 @@
 import pandas as pd
 
-from src.features.feature_engineering import build_training_features
+from app.src.features.feature_engineering import build_training_features
 
 
 def build_prediction_features(df: pd.DataFrame):

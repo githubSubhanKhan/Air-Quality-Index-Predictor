@@ -16,9 +16,6 @@ router = APIRouter(
 
 collection = get_collection()
 
-print("MONGODB_URI =", os.getenv("MONGODB_URI"))
-print("MONGODB_DB_NAME =", os.getenv("MONGODB_DB_NAME"))
-
 @router.get("/{city}")
 def predict_city(city: str):
 
