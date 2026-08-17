@@ -3,10 +3,22 @@ from datetime import datetime
 
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 
-DEFAULT_API_URL = os.getenv("AQI_API_URL", "http://127.0.0.1:8000")
+# Streamlit Cloud secrets live in st.secrets, but feature_store.py (and dotenv)
+# read from os.environ — bridge them before any DB-touching import runs.
+# Locally there's no secrets.toml at all, which makes st.secrets raise, so
+# this is a no-op there and feature_store.py's own load_dotenv() takes over.
+try:
+    for _key in ("MONGODB_URI", "MONGODB_DB_NAME"):
+        if _key in st.secrets:
+            os.environ[_key] = st.secrets[_key]
+except Exception:
+    pass
+
+from app.src.features.feature_store import get_collection
+from app.src.prediction.build_prediction_features import build_prediction_features
+from app.src.prediction.predictor import predict as predict_aqi
 
 # "Very Unhealthy"/"Hazardous" extend the palette's 4-step status scale to
 # match the 6-category EPA AQI standard users expect.
@@ -51,29 +63,44 @@ def get_aqi_category(aqi):
     return AQI_SCALE[-1][2], AQI_SCALE[-1][3]
 
 
-def fetch_json(url, params=None, timeout=15):
-    response = requests.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
-
-
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_cities(api_base):
+def fetch_cities():
     try:
-        data = fetch_json(f"{api_base}/cities", timeout=5)
-        return data.get("cities", [])
+        return sorted(get_collection().distinct("city"))
     except Exception:
         return []
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_prediction(api_base, city):
-    return fetch_json(f"{api_base}/predict/{city}")
+def fetch_prediction(city):
+    records = list(
+        get_collection().find({"city": city.lower()}).sort("timestamp", 1)
+    )
+
+    if not records:
+        return {"error": f"No data found for city '{city}'"}
+
+    df = pd.DataFrame(records)
+    features = build_prediction_features(df)
+    forecast = predict_aqi(features)
+
+    return {"city": city, "forecast": forecast}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_history(api_base, city, hours):
-    return fetch_json(f"{api_base}/history/{city}", params={"hours": hours})
+def fetch_history(city, hours):
+    records = list(
+        get_collection()
+        .find({"city": city.lower()}, {"_id": 0})
+        .sort("timestamp", -1)
+        .limit(hours)
+    )
+
+    if not records:
+        return {"error": f"No data found for city '{city}'"}
+
+    records.reverse()
+    return {"city": city, "count": len(records), "readings": records}
 
 
 def inject_css(t):
@@ -295,9 +322,7 @@ def main():
         st.title("🌫️ AQI Predictor")
         st.caption("3-day air quality forecasting dashboard")
 
-        api_base = st.text_input("API base URL", value=DEFAULT_API_URL).rstrip("/")
-
-        cities = fetch_cities(api_base)
+        cities = fetch_cities()
         if cities:
             city = st.selectbox("City", options=cities, index=0)
         else:
@@ -323,15 +348,12 @@ def main():
     inject_css(t)
 
     st.title("Air Quality Index Predictor")
-    st.caption(f"Live forecast for **{city.title()}**, powered by the AQI Predictor API")
+    st.caption(f"Live forecast for **{city.title()}**")
 
     try:
-        prediction = fetch_prediction(api_base, city)
-    except requests.exceptions.RequestException:
-        st.error(
-            f"Could not reach the API at `{api_base}`. "
-            "Make sure the FastAPI backend is running (`uvicorn app.main:app --reload`)."
-        )
+        prediction = fetch_prediction(city)
+    except Exception as exc:
+        st.error(f"Could not generate a forecast for `{city}`: {exc}")
         st.stop()
 
     if "error" in prediction:
@@ -347,8 +369,8 @@ def main():
         render_legend()
 
     try:
-        history = fetch_history(api_base, city, history_hours)
-    except requests.exceptions.RequestException:
+        history = fetch_history(city, history_hours)
+    except Exception:
         history = {"error": "unreachable"}
 
     latest_reading = None
