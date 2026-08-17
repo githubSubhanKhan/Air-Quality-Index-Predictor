@@ -22,6 +22,7 @@ def _previous_aqi(city: str, history_path: str):
 def build_openweather_feature_row(
     city: str,
     raw: dict,
+    weather:dict,
     history_path: str,
 ):
     dt = datetime.fromtimestamp(
@@ -63,8 +64,8 @@ def build_openweather_feature_row(
         "no2": components.get("no2"),
         "so2": components.get("so2"),
         "co": components.get("co"),
-        "temperature": None,
-        "humidity": None,
-        "pressure": None,
-        "wind_speed": None,
+        "temperature": weather.get("main", {}).get("temp"),
+        "humidity": weather.get("main", {}).get("humidity"),
+        "pressure": weather.get("main", {}).get("pressure"),
+        "wind_speed": weather.get("wind", {}).get("speed"),
     }

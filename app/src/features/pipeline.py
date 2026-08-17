@@ -5,6 +5,7 @@ import pandas as pd
 
 from app.src.features.fetch_openweather import (
     fetch_current_pollution,
+    fetch_current_weather
 )
 
 from app.src.features.build_openweather_features import (
@@ -21,9 +22,11 @@ HISTORY_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data",
 def run(city: str) -> dict:
     raw = fetch_current_pollution(city)
     history_path = os.path.abspath(HISTORY_PATH)
+    weather = fetch_current_weather(city)
     row = build_openweather_feature_row(
         city,
         raw,
+        weather,
         history_path,
     )
 

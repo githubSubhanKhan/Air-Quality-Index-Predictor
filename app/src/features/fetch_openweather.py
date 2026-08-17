@@ -12,6 +12,9 @@ CURRENT_AIR_POLLUTION_URL = (
     "https://api.openweathermap.org/data/2.5/air_pollution"
 )
 
+CURRENT_WEATHER_URL = (
+    "https://api.openweathermap.org/data/2.5/weather"
+)
 
 def _api_key() -> str:
     api_key = os.getenv("OPENWEATHER_API_KEY")
@@ -70,3 +73,25 @@ def fetch_current_pollution(city: str) -> dict:
     payload = response.json()
 
     return payload["list"][0]
+
+def fetch_current_weather(city: str) -> dict:
+    """
+    Fetch current weather data for a city.
+    """
+
+    lat, lon = geocode_city(city)
+
+    response = requests.get(
+        CURRENT_WEATHER_URL,
+        params={
+            "lat": lat,
+            "lon": lon,
+            "appid": _api_key(),
+            "units": "metric",
+        },
+        timeout=10,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
