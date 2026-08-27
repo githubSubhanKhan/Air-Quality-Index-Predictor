@@ -11,12 +11,22 @@ on:
         description: "City to retrain for"
         required: false
         default: "karachi"
+      promotion:
+        description: "Promotion policy for the new versions"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - always
+          - never
 
-# The retrained models are committed back to the branch so the Streamlit app,
-# which loads the .pkl files straight from the repo, picks them up.
+# Nothing is committed back to the repo: the retrained models are published to
+# the MongoDB model registry and serving reads the production stage from there.
 permissions:
-  contents: write
+  contents: read
 
+# Versions are numbered per model name, so only one retrain at a time.
 concurrency:
   group: daily-training
   cancel-in-progress: false
@@ -24,6 +34,12 @@ concurrency:
 jobs:
   retrain:
     runs-on: ubuntu-latest
+
+    env:
+      MONGODB_URI: ${{ secrets.MONGODB_URI }}
+      MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+      CITY: ${{ github.event.inputs.city || 'karachi' }}
+      PROMOTION: ${{ github.event.inputs.promotion || 'auto' }}
 
     steps:
       - name: Checkout Repository
@@ -40,19 +56,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Retrain Forecast Models
-        env:
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
-          CITY: ${{ github.event.inputs.city || 'karachi' }}
+      - name: Retrain And Publish To Registry
         run: |
-          python -m app.src.training.train --city "$CITY"
+          python -m app.src.training.train \
+            --city "$CITY" \
+            --promotion "$PROMOTION" \
+            --no-save
 
-      - name: Smoke Test Retrained Models
-        env:
-          MONGODB_URI: ${{ secrets.MONGODB_URI }}
-          MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
-          CITY: ${{ github.event.inputs.city || 'karachi' }}
+      - name: Smoke Test Production Models
         run: |
           python - <<'PY'
           import os
@@ -63,7 +74,7 @@ jobs:
           from app.src.prediction.build_prediction_features import (
               build_prediction_features,
           )
-          from app.src.prediction.predictor import predict
+          from app.src.prediction.predictor import model_info, predict
 
           city = os.environ["CITY"].lower()
 
@@ -73,35 +84,31 @@ jobs:
               .sort("timestamp", 1)
           )
 
+          info = model_info()
+
+          if info["source"] != "registry":
+              raise SystemExit(
+                  "Expected to serve from the registry, got "
+                  f"'{info['source']}'"
+              )
+
+          versions = {
+              horizon: entry["version"]
+              for horizon, entry in info["horizons"].items()
+          }
+
           forecast = predict(build_prediction_features(pd.DataFrame(records)))
 
-          print("Forecast from retrained models:", forecast)
+          print("Serving versions:", versions)
+          print("Forecast:", forecast)
           PY
 
-      - name: Publish Metrics To Job Summary
+      - name: Publish Registry State To Job Summary
         run: |
           {
-            echo "### Retraining metrics"
+            echo "### Model registry after retrain"
             echo ""
-            echo '```json'
-            cat app/models/training_metadata.json
+            echo '```'
+            python -m app.src.registry.cli list --limit 12
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Commit Retrained Models
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add app/models
-
-          if git diff --cached --quiet; then
-            echo "Models unchanged; nothing to commit."
-            exit 0
-          fi
-
-          git commit -m "chore: daily model retrain ($(date -u +'%Y-%m-%d %H:%M UTC'))"
-
-          git pull --rebase --autostash origin "${{ github.ref_name }}"
-
-          git push origin "HEAD:${{ github.ref_name }}"

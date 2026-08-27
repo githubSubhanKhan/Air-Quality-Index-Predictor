@@ -11,15 +11,23 @@ COLLECTION_NAME = "aqi_features"
 _client = None
 
 
-def _get_collection():
+def _get_client():
     global _client
 
     if _client is None:
         _client = MongoClient(os.getenv("MONGODB_URI"))
 
-    db = _client[os.getenv("MONGODB_DB_NAME", "aqi_predictor")]
+    return _client
 
-    return db[COLLECTION_NAME]
+
+def get_database():
+    """The project database — shared by the feature store and model registry."""
+
+    return _get_client()[os.getenv("MONGODB_DB_NAME", "aqi_predictor")]
+
+
+def _get_collection():
+    return get_database()[COLLECTION_NAME]
 
 
 def get_collection():

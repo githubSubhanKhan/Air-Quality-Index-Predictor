@@ -18,6 +18,7 @@ except Exception:
 
 from app.src.features.feature_store import get_collection
 from app.src.prediction.build_prediction_features import build_prediction_features
+from app.src.prediction.predictor import model_info
 from app.src.prediction.predictor import predict as predict_aqi
 
 # "Very Unhealthy"/"Hazardous" extend the palette's 4-step status scale to
@@ -85,6 +86,14 @@ def fetch_prediction(city):
     forecast = predict_aqi(features)
 
     return {"city": city, "forecast": forecast}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_model_info():
+    try:
+        return model_info()
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -315,6 +324,45 @@ def render_weather_metrics(latest_reading):
         col.metric(label, f"{value:.1f} {unit}" if value is not None else "—")
 
 
+def render_model_provenance(info):
+    """Which registry version is serving, and how well it scored."""
+
+    if not info:
+        st.caption("Model registry: unavailable")
+        return
+
+    if info["source"] == "registry":
+        st.caption("Source: MongoDB model registry (production stage)")
+    else:
+        st.caption("Source: local model files (registry unavailable)")
+
+    with st.expander("Versions & metrics"):
+        for horizon, entry in info["horizons"].items():
+            metrics = entry.get("metrics", {})
+            version = entry.get("version")
+            r2 = metrics.get("r2")
+            mae = metrics.get("mae")
+
+            label = f"v{version}" if version else entry.get("stage", "local")
+
+            if mae is None or r2 is None:
+                st.markdown(f"**{horizon}** · {label}")
+            else:
+                st.markdown(f"**{horizon}** · {label} · MAE {mae:.2f} · R² {r2:.3f}")
+
+        trained_at = next(
+            (
+                entry.get("created_at")
+                for entry in info["horizons"].values()
+                if entry.get("created_at")
+            ),
+            None,
+        )
+
+        if trained_at:
+            st.caption(f"Trained: {trained_at}")
+
+
 def main():
     st.set_page_config(page_title="AQI Predictor", page_icon="🌫️", layout="wide")
 
@@ -338,10 +386,12 @@ def main():
         if st.button("🔄 Refresh now", use_container_width=True):
             fetch_prediction.clear()
             fetch_history.clear()
+            fetch_model_info.clear()
             st.rerun()
 
         st.divider()
         st.caption("Model: XGBoost (day-wise, 3-horizon)")
+        render_model_provenance(fetch_model_info())
         st.caption(f"Last checked: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     t = THEME

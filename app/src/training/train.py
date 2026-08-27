@@ -3,8 +3,10 @@ Retraining pipeline for the 3-day AQI forecast models.
 
 Reads the MongoDB feature store, rebuilds the lag / rolling feature set,
 trains one XGBoost regressor per forecast horizon (day 1, 2 and 3) on a
-time-based split, then persists the models, the feature column list and the
-run's evaluation metrics to ``app/models/``.
+time-based split, then **publishes each model to the model registry** with
+the metrics it earned. The registry — not the local ``.pkl`` files — is what
+serving reads from, so a retrain ships by promoting a version rather than by
+committing a binary.
 
 This is the scripted equivalent of
 ``app/notebooks/lag_feature_engineering_3_days.ipynb`` so the same training
@@ -12,16 +14,21 @@ can run unattended from GitHub Actions.
 
 Usage:
     python -m app.src.training.train --city karachi
+    python -m app.src.training.train --city karachi --no-publish --no-save
+    python -m app.src.training.train --city karachi --promotion never
 """
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+import sklearn
+import xgboost
 from dotenv import load_dotenv
 from sklearn.metrics import (
     mean_absolute_error,
@@ -32,6 +39,7 @@ from xgboost import XGBRegressor
 
 from app.src.features.feature_engineering import build_training_features
 from app.src.features.feature_store import get_collection
+from app.src.registry import model_registry as registry
 
 load_dotenv()
 
@@ -105,9 +113,23 @@ DEFAULT_TEST_SIZE = 0.2
 # roughly three weeks of hourly readings after lags and targets are dropped.
 DEFAULT_MIN_ROWS = 500
 
+# Which metric the registry promotion gate compares runs on.
+PROMOTION_METRIC = "mae"
+
 
 def target_column(horizon: str) -> str:
     return f"target_{horizon}"
+
+
+def environment_snapshot() -> dict:
+    """Library versions the models were trained with, recorded per version."""
+
+    return {
+        "python": sys.version.split()[0],
+        "xgboost": xgboost.__version__,
+        "scikit_learn": sklearn.__version__,
+        "pandas": pd.__version__,
+    }
 
 
 def load_feature_store(city: str) -> pd.DataFrame:
@@ -191,12 +213,16 @@ def run(
     min_rows: int = DEFAULT_MIN_ROWS,
     model_dir: Path = MODEL_DIR,
     save: bool = True,
+    publish: bool = True,
+    promotion: str = "auto",
+    keep: int = registry.DEFAULT_ARTIFACTS_KEPT,
+    tolerance: float = registry.DEFAULT_DEGRADATION_TOLERANCE,
 ) -> dict:
     """
     Retrain every forecast horizon and return the run's metadata.
 
-    Models are only written once all three horizons have trained, so a
-    failure part-way through leaves the previously shipped models in place.
+    Nothing is published until all three horizons have trained, so a failure
+    part-way through leaves the current production models serving.
     """
 
     raw = load_feature_store(city)
@@ -235,7 +261,7 @@ def run(
         f"Missing hours : {missing_hours}\n"
     )
 
-    # Persistence baseline: assume the next three days look like right now.
+    # Persistence baseline: assume the next three days look like now.
     # A horizon that cannot beat this is not adding value.
     baseline_pred = df["aqi"].iloc[split:]
 
@@ -264,13 +290,17 @@ def run(
             f"(persistence baseline R2 {metrics[horizon]['baseline_r2']:.4f})"
         )
 
+    trained_at = datetime.now(timezone.utc)
+
     metadata = {
-        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "run_id": trained_at.strftime("%Y%m%dT%H%M%SZ"),
+        "trained_at": trained_at.isoformat(timespec="seconds"),
         "city": city.lower(),
         "model_type": "XGBRegressor",
         "model_params": XGB_PARAMS,
         "test_size": test_size,
         "features": FEATURE_COLUMNS,
+        "environment": environment_snapshot(),
         "data": {
             "rows_in_store": rows_in_store,
             "usable_rows": len(df),
@@ -283,12 +313,109 @@ def run(
         "metrics": metrics,
     }
 
+    if publish:
+        metadata["registry"] = publish_to_registry(
+            models,
+            metadata,
+            promotion=promotion,
+            keep=keep,
+            tolerance=tolerance,
+        )
+    else:
+        print("\n--no-publish set: models were not sent to the registry.")
+
     if save:
         save_artifacts(models, metadata, model_dir)
     else:
-        print("\n--no-save set: models were not written to disk.")
+        print("--no-save set: models were not written to disk.")
 
     return metadata
+
+
+def publish_to_registry(
+    models: dict,
+    metadata: dict,
+    promotion: str = "auto",
+    keep: int = registry.DEFAULT_ARTIFACTS_KEPT,
+    tolerance: float = registry.DEFAULT_DEGRADATION_TOLERANCE,
+) -> dict:
+    """
+    Register every horizon's model and apply the promotion policy.
+
+    ``promotion`` is one of:
+      auto   — promote unless the candidate is materially worse than the
+               incumbent on the promotion metric (the default),
+      always — promote regardless,
+      never  — register as ``staging`` only, for a human to promote.
+    """
+
+    print("\nPublishing to the model registry")
+
+    published = {}
+
+    for horizon, model in models.items():
+        name = registry.model_name(horizon)
+
+        incumbent = registry.get_production(name)
+
+        document = registry.register_model(
+            name,
+            model,
+            metrics=metadata["metrics"][horizon],
+            params=metadata["model_params"],
+            features=metadata["features"],
+            city=metadata["city"],
+            horizon=horizon,
+            run_id=metadata["run_id"],
+            data=metadata["data"],
+            environment=metadata["environment"],
+        )
+
+        version = document["version"]
+
+        if promotion == "never":
+            promote, reason = False, "promotion disabled for this run"
+
+        elif promotion == "always":
+            promote, reason = True, "promotion forced for this run"
+
+        else:
+            promote, reason = registry.passes_promotion_gate(
+                metadata["metrics"][horizon],
+                incumbent,
+                metric=PROMOTION_METRIC,
+                tolerance=tolerance,
+            )
+
+        if promote:
+            document = registry.promote(name, version)
+
+        pruned = registry.prune_artifacts(name, keep=keep)
+
+        published[horizon] = {
+            "name": name,
+            "version": version,
+            "stage": document["stage"],
+            "promoted": promote,
+            "reason": reason,
+            "previous_production_version": (
+                incumbent["version"] if incumbent else None
+            ),
+            "artifacts_pruned": pruned,
+        }
+
+        print(
+            f"  {name} v{version} -> {document['stage']} ({reason})"
+            + (f"; pruned {pruned} old artifact(s)" if pruned else "")
+        )
+
+    return {
+        "collection": registry.REGISTRY_COLLECTION,
+        "artifact_bucket": registry.ARTIFACT_BUCKET,
+        "promotion_policy": promotion,
+        "promotion_metric": PROMOTION_METRIC,
+        "published": published,
+    }
 
 
 def save_artifacts(
@@ -296,27 +423,36 @@ def save_artifacts(
     metadata: dict,
     model_dir: Path = MODEL_DIR,
 ) -> None:
-    """Write the trained models, feature list and metrics report."""
+    """
+    Write a local copy of the models, the feature list and the metrics.
+
+    ``app/models/`` is git-ignored — these are a development convenience and
+    an offline fallback, not the artifacts serving depends on.
+    """
 
     model_dir = Path(model_dir)
 
     model_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts = {}
 
     for horizon, model in models.items():
         filename = f"xgboost_{horizon}.pkl"
 
         joblib.dump(model, model_dir / filename)
 
-        metadata["metrics"][horizon]["model_file"] = filename
+        artifacts[horizon] = filename
 
     joblib.dump(FEATURE_COLUMNS, model_dir / "feature_columns.pkl")
+
+    metadata["local_artifacts"] = artifacts
 
     metadata_path = model_dir / METADATA_FILENAME
 
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"\nSaved models and {METADATA_FILENAME} to {model_dir}")
+    print(f"Saved a local copy of the models to {model_dir}")
 
 
 def main() -> None:
@@ -347,13 +483,43 @@ def main() -> None:
     parser.add_argument(
         "--model-dir",
         default=str(MODEL_DIR),
-        help="Directory the models and metrics are written to",
+        help="Directory the local model copy is written to",
     )
 
     parser.add_argument(
         "--no-save",
         action="store_true",
-        help="Train and report metrics without overwriting the shipped models",
+        help="Skip the local .pkl copy",
+    )
+
+    parser.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Skip publishing to the model registry",
+    )
+
+    parser.add_argument(
+        "--promotion",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Promotion policy for the newly registered versions",
+    )
+
+    parser.add_argument(
+        "--keep",
+        type=int,
+        default=registry.DEFAULT_ARTIFACTS_KEPT,
+        help="Model artifacts to keep per horizon (metrics are kept forever)",
+    )
+
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=registry.DEFAULT_DEGRADATION_TOLERANCE,
+        help=(
+            "How much worse than production a candidate may be on "
+            f"{PROMOTION_METRIC} and still be promoted, e.g. 0.25 for 25%%"
+        ),
     )
 
     args = parser.parse_args()
@@ -364,6 +530,10 @@ def main() -> None:
         min_rows=args.min_rows,
         model_dir=Path(args.model_dir),
         save=not args.no_save,
+        publish=not args.no_publish,
+        promotion=args.promotion,
+        keep=args.keep,
+        tolerance=args.tolerance,
     )
 
 

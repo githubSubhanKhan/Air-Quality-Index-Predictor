@@ -6,3 +6,7 @@ __pycache__/
 /data/
 
 Affan*/
+
+# Model artifacts live in the MongoDB model registry, not in git.
+# These are only a local development copy.
+app/models/

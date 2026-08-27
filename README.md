@@ -90,7 +90,21 @@ The system collects live and historical air quality data, engineers features int
 - `app/src/training/train.py` — the scripted equivalent of the 3-day notebook, so retraining can run unattended: loads the city's rows from the feature store, dedupes on timestamp, rebuilds the lag/rolling features via the shared `feature_engineering` module, recreates the `target_day1/2/3` windows, trains one XGBoost regressor per horizon on a time-based 80/20 split, and writes the models only after all three have trained (a mid-run failure leaves the shipped models untouched).
 - Guardrails: refuses to train on fewer than `--min-rows` usable rows (default 500), and scores every horizon against a **persistence baseline** (assume the next three days look like now) so a horizon that adds no value is visible in the metrics.
 - Alongside the `.pkl` files it writes `app/models/training_metadata.json` — trained-at timestamp, city, hyperparameters, row counts, data range, missing hourly rows, and MAE / RMSE / R² (plus baseline R²) per horizon.
-- `.github/workflows/daily_training.yml` — runs daily at 02:30 UTC (07:30 PKT) or on demand via *Run workflow*: retrain → smoke-test the new models through the real serving path → publish the metrics to the run summary → commit `app/models/` back to the branch, which is what makes the Streamlit app pick up the fresh models.
+- `.github/workflows/daily_training.yml` — runs daily at 02:30 UTC (07:30 PKT) or on demand via *Run workflow*: retrain → publish each horizon to the model registry → smoke-test whatever is now in `production` through the real serving path → print the registry table to the run summary. Nothing is committed back to the repo, so the workflow only needs `contents: read`.
+
+### ✅ Model registry (MongoDB + GridFS)
+- `app/src/registry/model_registry.py` — models are no longer just `.pkl` files in the repo. Every training run publishes each horizon to a registry that lives in the same MongoDB database as the feature store, so there is no extra service to host and no credentials beyond `MONGODB_URI`:
+  - `model_registry` — one document per `(name, version)`: the **metrics** it earned (MAE / RMSE / R² + persistence-baseline R²), the **hyperparameters**, the **feature list**, the **data lineage** (row counts, date range, missing hours), the **library versions** it was trained with, the commit SHA when run from CI, and a SHA-256 checksum of the artifact.
+  - `model_artifacts.*` — the pickled models themselves in GridFS, compressed (~380 KB per model instead of 1.2 MB).
+  - Stages: `staging` → `production` → `archived`, one production version per model name.
+- **Promotion is a metadata change, not a redeploy.** Serving asks the registry for the production version, so `promote` / `rollback` take effect without touching code or committing a binary.
+- Promotion gate: a retrain is auto-promoted unless it is more than 25% worse than the incumbent on MAE. Each run is scored on its own hold-out window, so run-to-run metrics are not strictly comparable — the gate is a guard against a broken run, not a fine-grained comparison. Override per run with `--promotion always|never`.
+- Retention: the newest 5 versions (and always production) keep their GridFS binary; older binaries are pruned while their **metric history is kept forever**, so the free-tier Atlas cluster does not fill up with a year of daily models.
+- Integrity: every load re-checks the SHA-256 and refuses to serve a mismatch, and a version whose binary has been pruned cannot be promoted or rolled back into.
+- `app/src/registry/cli.py` — `list`, `show`, `promote`, `rollback`, `prune`, `download`.
+- `app/routes/models.py` — `GET /models` (what is serving now, with metrics), `GET /models/versions` (metric history per horizon), `GET /models/names`. Read-only on purpose: promotion changes what production serves, so it stays in the CLI rather than on an unauthenticated endpoint.
+- `app/src/prediction/predictor.py` — loads the production version of each horizon from the registry and uses **that version's own feature list**, so one horizon can be retrained on different features without breaking the others. The git-ignored `.pkl` files in `app/models/` are only a local-development fallback.
+- The dashboard sidebar shows which versions are serving and what they scored.
 
 ---
 
@@ -134,7 +148,7 @@ The system collects live and historical air quality data, engineers features int
 
 ### 🔜 Phase 6 — Automation & deployment
 - [x] `.github/workflows/data_pipeline.yml` — runs `pipeline.py` hourly, credentials via GitHub Secrets.
-- [x] `.github/workflows/daily_training.yml` — retrains daily and commits the refreshed models.
+- [x] `.github/workflows/daily_training.yml` — retrains daily and publishes the new versions to the model registry.
 - [ ] Deploy the API and dashboard (e.g. Render) and document the live URLs.
 
 ### 🔜 Phase 7 — Engineering hygiene
@@ -152,8 +166,9 @@ Air-Quality-Index-Predictor/
 ├── app/
 │   ├── main.py                                     # FastAPI application entry point
 │   ├── routes/
-│   │   └── health.py                               # /health endpoint
-│   ├── models/                                      # Trained model artifacts (.pkl) + training_metadata.json
+│   │   ├── health.py                               # /health endpoint
+│   │   └── models.py                               # /models registry endpoints
+│   ├── models/                                      # Local dev copy of the models (git-ignored; registry is authoritative)
 │   ├── notebooks/
 │   │   ├── eda.ipynb                                # Exploratory data analysis
 │   │   ├── train_data.ipynb                         # First-pass Linear Regression / Random Forest baseline
@@ -172,8 +187,11 @@ Air-Quality-Index-Predictor/
 │       ├── prediction/
 │       │   ├── build_prediction_features.py   # Latest feature row for serving
 │       │   └── predictor.py                   # Loads the .pkl models, returns the 3-day forecast
-│       └── training/
-│           └── train.py              # Daily retraining pipeline (CLI)
+│       ├── training/
+│       │   └── train.py              # Daily retraining pipeline (CLI)
+│       └── registry/
+│           ├── model_registry.py     # MongoDB/GridFS model registry
+│           └── cli.py                # Registry CLI (list/show/promote/rollback/prune)
 ├── .github/workflows/
 │   ├── data_pipeline.yml             # Hourly feature pipeline
 │   └── daily_training.yml            # Daily model retraining
@@ -249,8 +267,18 @@ python -m app.src.features.backfill --city karachi --days 365
 # Retrain the 3-day forecast models (what the daily workflow runs)
 python -m app.src.training.train --city karachi
 
-# Same, but report metrics without overwriting the shipped models
-python -m app.src.training.train --city karachi --no-save
+# Train and report metrics without publishing or overwriting anything
+python -m app.src.training.train --city karachi --no-publish --no-save
+
+# Register the new versions but leave promotion to a human
+python -m app.src.training.train --city karachi --promotion never
+
+# Inspect the model registry
+python -m app.src.registry.cli list
+python -m app.src.registry.cli show aqi_xgboost_day3
+python -m app.src.registry.cli promote aqi_xgboost_day3 4
+python -m app.src.registry.cli rollback aqi_xgboost_day3
+python -m app.src.registry.cli prune --keep 5
 
 # Open the notebooks
 jupyter notebook app/notebooks/eda.ipynb
@@ -273,6 +301,18 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | `aqi_change_rate` | Difference from the previous reading's AQI |
 | `pm25`, `pm10`, `o3`, `no2`, `so2`, `co` | Pollutant readings |
 | `temperature`, `humidity`, `pressure`, `wind_speed` | Weather readings (backfilled via Open-Meteo, live via WAQI) |
+
+### Stored in the model registry (`model_registry` collection + `model_artifacts` GridFS bucket)
+
+| Field | Description |
+|-------|-------------|
+| `name`, `version` | Registry identity, e.g. `aqi_xgboost_day3` v4 — unique and monotonic per name |
+| `stage` | `staging`, `production` or `archived`; one production version per name |
+| `metrics` | `mae`, `rmse`, `r2`, `baseline_r2` on that run's hold-out window |
+| `params`, `features`, `environment` | Hyperparameters, feature list and library versions used |
+| `data` | Lineage: row counts, train/test split, first/last timestamp, missing hourly rows |
+| `run_id`, `git_sha`, `created_at`, `promoted_at` | Which training run and commit produced it, and when it shipped |
+| `artifact` | GridFS file id, size, SHA-256 checksum, and whether the binary is still retained |
 
 ### Engineered at training time (notebooks only, not yet in the store)
 
@@ -305,4 +345,5 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Prediction API endpoints | 🔜 Pending |
 | Dashboard | 🔜 Pending |
 | GitHub Actions automation | ✅ Done — hourly feature pipeline + daily retraining |
+| Model registry with metrics (MongoDB + GridFS) | ✅ Done — versioning, stages, promotion gate, rollback, retention |
 | Deployment | 🔜 Pending |
