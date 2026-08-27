@@ -83,6 +83,15 @@ The system collects live and historical air quality data, engineers features int
 - Saved to `app/models/xgboost_day1.pkl`, `xgboost_day2.pkl`, `xgboost_day3.pkl`.
 - Accuracy degrades sharply with horizon: Day 1 R² = 0.70 (MAE 6.52), Day 2 R² = 0.22 (MAE 10.88), Day 3 R² = -0.05 (MAE 12.96) — the 3-day-ahead model currently performs no better than predicting the mean.
 
+### ✅ Automated hourly feature pipeline (GitHub Actions)
+- `.github/workflows/data_pipeline.yml` — runs `app.src.features.pipeline` every hour with API keys and the MongoDB URI supplied through GitHub Secrets, so the feature store keeps growing without manual runs.
+
+### ✅ Automated daily retraining (GitHub Actions)
+- `app/src/training/train.py` — the scripted equivalent of the 3-day notebook, so retraining can run unattended: loads the city's rows from the feature store, dedupes on timestamp, rebuilds the lag/rolling features via the shared `feature_engineering` module, recreates the `target_day1/2/3` windows, trains one XGBoost regressor per horizon on a time-based 80/20 split, and writes the models only after all three have trained (a mid-run failure leaves the shipped models untouched).
+- Guardrails: refuses to train on fewer than `--min-rows` usable rows (default 500), and scores every horizon against a **persistence baseline** (assume the next three days look like now) so a horizon that adds no value is visible in the metrics.
+- Alongside the `.pkl` files it writes `app/models/training_metadata.json` — trained-at timestamp, city, hyperparameters, row counts, data range, missing hourly rows, and MAE / RMSE / R² (plus baseline R²) per horizon.
+- `.github/workflows/daily_training.yml` — runs daily at 02:30 UTC (07:30 PKT) or on demand via *Run workflow*: retrain → smoke-test the new models through the real serving path → publish the metrics to the run summary → commit `app/models/` back to the branch, which is what makes the Streamlit app pick up the fresh models.
+
 ---
 
 ## 3. What Is Remaining
@@ -124,13 +133,13 @@ The system collects live and historical air quality data, engineers features int
 - [ ] Dashboard (Streamlit) with: current AQI card, 3-day forecast, hourly history chart, model metrics and SHAP plot.
 
 ### 🔜 Phase 6 — Automation & deployment
-- [ ] `.github/workflows/feature_pipeline.yml` — run `pipeline.py` hourly, credentials via GitHub Secrets.
-- [ ] `.github/workflows/training_pipeline.yml` — retrain on a daily schedule.
+- [x] `.github/workflows/data_pipeline.yml` — runs `pipeline.py` hourly, credentials via GitHub Secrets.
+- [x] `.github/workflows/daily_training.yml` — retrains daily and commits the refreshed models.
 - [ ] Deploy the API and dashboard (e.g. Render) and document the live URLs.
 
 ### 🔜 Phase 7 — Engineering hygiene
 - [ ] Add `.env.example`, tests for `aqi.py` / `build_features.py`, and logging in place of `print`.
-- [ ] `requirements.txt` still doesn't list `scikit-learn`, `xgboost`, `lightgbm`, `joblib` or `numpy`, even though the training notebooks now depend on them — add them so a fresh clone can run the notebooks.
+- [x] `requirements.txt` now lists `scikit-learn`, `xgboost`, `joblib` and `numpy`, which the retraining pipeline needs in CI (`lightgbm` is still notebook-only).
 - [ ] Add `shap`, `plotly`, `streamlit` to `requirements.txt` as those phases land.
 - [ ] Remove the vendored `Affan Project/` reference repo from the working tree before final submission.
 
@@ -144,7 +153,7 @@ Air-Quality-Index-Predictor/
 │   ├── main.py                                     # FastAPI application entry point
 │   ├── routes/
 │   │   └── health.py                               # /health endpoint
-│   ├── models/                                      # Trained model artifacts (.pkl, git-ignored)
+│   ├── models/                                      # Trained model artifacts (.pkl) + training_metadata.json
 │   ├── notebooks/
 │   │   ├── eda.ipynb                                # Exploratory data analysis
 │   │   ├── train_data.ipynb                         # First-pass Linear Regression / Random Forest baseline
@@ -160,6 +169,14 @@ Air-Quality-Index-Predictor/
 │           ├── feature_store.py      # MongoDB feature store writes
 │           ├── pipeline.py           # Hourly feature pipeline (CLI)
 │           └── backfill.py           # Historical backfill (CLI)
+│       ├── prediction/
+│       │   ├── build_prediction_features.py   # Latest feature row for serving
+│       │   └── predictor.py                   # Loads the .pkl models, returns the 3-day forecast
+│       └── training/
+│           └── train.py              # Daily retraining pipeline (CLI)
+├── .github/workflows/
+│   ├── data_pipeline.yml             # Hourly feature pipeline
+│   └── daily_training.yml            # Daily model retraining
 ├── data/                             # Local CSV cache (git-ignored)
 ├── requirements.txt
 ├── .env                              # Secrets (git-ignored)
@@ -201,10 +218,8 @@ venv\Scripts\activate          # Windows
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. requirements.txt doesn't yet include the modelling libraries used by the
-#    notebooks (see Phase 7 in "What Is Remaining") — install them too if you
-#    plan to run the training notebooks:
-pip install scikit-learn xgboost lightgbm joblib numpy
+# 3. lightgbm is only used by the comparison notebook, so it isn't pinned:
+pip install lightgbm
 ```
 
 ### Environment variables
@@ -230,6 +245,12 @@ python -m app.src.features.pipeline --city karachi
 
 # Backfill the last 365 days of history for a city (pollutants + weather)
 python -m app.src.features.backfill --city karachi --days 365
+
+# Retrain the 3-day forecast models (what the daily workflow runs)
+python -m app.src.training.train --city karachi
+
+# Same, but report metrics without overwriting the shipped models
+python -m app.src.training.train --city karachi --no-save
 
 # Open the notebooks
 jupyter notebook app/notebooks/eda.ipynb
@@ -283,5 +304,5 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Explainability (SHAP) | 🔜 Pending |
 | Prediction API endpoints | 🔜 Pending |
 | Dashboard | 🔜 Pending |
-| GitHub Actions automation | 🔜 Pending |
+| GitHub Actions automation | ✅ Done — hourly feature pipeline + daily retraining |
 | Deployment | 🔜 Pending |

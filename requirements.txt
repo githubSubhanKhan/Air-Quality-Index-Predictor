@@ -24,3 +24,5 @@ streamlit
 plotly
 joblib
 xgboost
+scikit-learn
+numpy

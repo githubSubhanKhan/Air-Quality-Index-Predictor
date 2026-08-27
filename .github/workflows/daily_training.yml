@@ -1,0 +1,107 @@
+name: AQI Daily Model Training
+
+on:
+  schedule:
+    # Every day at 02:30 UTC (07:30 PKT), after the hourly feature run
+    - cron: "30 2 * * *"
+
+  workflow_dispatch:
+    inputs:
+      city:
+        description: "City to retrain for"
+        required: false
+        default: "karachi"
+
+# The retrained models are committed back to the branch so the Streamlit app,
+# which loads the .pkl files straight from the repo, picks them up.
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-training
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set Up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Retrain Forecast Models
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+          CITY: ${{ github.event.inputs.city || 'karachi' }}
+        run: |
+          python -m app.src.training.train --city "$CITY"
+
+      - name: Smoke Test Retrained Models
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB_NAME: ${{ secrets.MONGODB_DB_NAME }}
+          CITY: ${{ github.event.inputs.city || 'karachi' }}
+        run: |
+          python - <<'PY'
+          import os
+
+          import pandas as pd
+
+          from app.src.features.feature_store import get_collection
+          from app.src.prediction.build_prediction_features import (
+              build_prediction_features,
+          )
+          from app.src.prediction.predictor import predict
+
+          city = os.environ["CITY"].lower()
+
+          records = list(
+              get_collection()
+              .find({"city": city}, {"_id": 0})
+              .sort("timestamp", 1)
+          )
+
+          forecast = predict(build_prediction_features(pd.DataFrame(records)))
+
+          print("Forecast from retrained models:", forecast)
+          PY
+
+      - name: Publish Metrics To Job Summary
+        run: |
+          {
+            echo "### Retraining metrics"
+            echo ""
+            echo '```json'
+            cat app/models/training_metadata.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit Retrained Models
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add app/models
+
+          if git diff --cached --quiet; then
+            echo "Models unchanged; nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: daily model retrain ($(date -u +'%Y-%m-%d %H:%M UTC'))"
+
+          git pull --rebase --autostash origin "${{ github.ref_name }}"
+
+          git push origin "HEAD:${{ github.ref_name }}"
