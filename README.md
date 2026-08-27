@@ -81,13 +81,13 @@ The system collects live and historical air quality data, engineers features int
 ### ✅ Day-wise 3-day forecasting
 - `app/notebooks/lag_feature_engineering_3_days.ipynb` — instead of iterative single-step forecasting, trains **three independent XGBoost regressors**, each predicting the *mean* AQI over a future window: `target_day1` (next 1–24h), `target_day2` (25–48h), `target_day3` (49–72h).
 - Saved to `app/models/xgboost_day1.pkl`, `xgboost_day2.pkl`, `xgboost_day3.pkl`.
-- Accuracy degrades sharply with horizon: Day 1 R² = 0.70 (MAE 6.52), Day 2 R² = 0.22 (MAE 10.88), Day 3 R² = -0.05 (MAE 12.96) — the 3-day-ahead model currently performs no better than predicting the mean.
+- Accuracy degrades with horizon, as expected. These notebook numbers are superseded by the reworked pipeline documented under *Day-3 accuracy rework* below.
 
 ### ✅ Automated hourly feature pipeline (GitHub Actions)
 - `.github/workflows/data_pipeline.yml` — runs `app.src.features.pipeline` every hour with API keys and the MongoDB URI supplied through GitHub Secrets, so the feature store keeps growing without manual runs.
 
 ### ✅ Automated daily retraining (GitHub Actions)
-- `app/src/training/train.py` — the scripted equivalent of the 3-day notebook, so retraining can run unattended: loads the city's rows from the feature store, dedupes on timestamp, rebuilds the lag/rolling features via the shared `feature_engineering` module, recreates the `target_day1/2/3` windows, trains one XGBoost regressor per horizon on a time-based 80/20 split, and writes the models only after all three have trained (a mid-run failure leaves the shipped models untouched).
+- `app/src/training/train.py` — retraining runs unattended: loads the city's rows from the feature store, rebuilds features via the shared `feature_engineering` module, recreates the `target_day1/2/3` windows, trains one XGBoost regressor per horizon on a purged chronological split, and publishes only after all three have trained (a mid-run failure leaves the production models serving).
 - Guardrails: refuses to train on fewer than `--min-rows` usable rows (default 500), and scores every horizon against a **persistence baseline** (assume the next three days look like now) so a horizon that adds no value is visible in the metrics.
 - Alongside the `.pkl` files it writes `app/models/training_metadata.json` — trained-at timestamp, city, hyperparameters, row counts, data range, missing hourly rows, and MAE / RMSE / R² (plus baseline R²) per horizon.
 - `.github/workflows/daily_training.yml` — runs daily at 02:30 UTC (07:30 PKT) or on demand via *Run workflow*: retrain → publish each horizon to the model registry → smoke-test whatever is now in `production` through the real serving path → print the registry table to the run summary. Nothing is committed back to the repo, so the workflow only needs `contents: read`.
@@ -114,6 +114,39 @@ The system collects live and historical air quality data, engineers features int
 - `app/routes/explain.py` — `GET /explain/{city}` (per-prediction contributions, optional `horizon` and `top`), `GET /explain/global` (the stored global ranking for the production versions).
 - Dashboard — a **Why This Forecast?** section with one tab per horizon: a diverging bar chart of each feature's push on the forecast (red up, blue down, signed labels), the baseline → forecast arithmetic, and an expander with that version's overall drivers from the registry.
 
+### ✅ Day-3 accuracy rework
+
+Day 3's R² was **-0.03** — worse than predicting the mean. Diagnosis first, in the data rather than the model:
+
+| Problem | Evidence |
+|---|---|
+| Severe train/test distribution shift | Between the training and evaluation windows of the 2025-26 data, o3 fell **54%**, no2 **83%**, co **58%**, pm2.5 **45%**. Trees cannot extrapolate, and SHAP confirmed day 3 was leaning on exactly these absolute levels (o3 was its top driver) with no AQI lag near the top. |
+| A calendar value never seen in training | Training covered months 1-6 and 8-12; the test window covered 6, 7, 8. **Month 7 never appeared in training**, so every split on `month` sent July down an untrained branch. |
+| Lags that were not really lags | 221 readings sat off the hour (the live pipeline records the observation time) and there were 21 gaps over 2h — all inside the evaluation window — so `shift(24)` meant "24 rows ago", not "24 hours ago". |
+| Optimistic evaluation | A row's target window reaches 72 hours ahead, so training targets overlapped the test window. Removing that leakage made the old configuration's day-3 score swing between +0.19 and **-1.80** depending on which window it was measured on. |
+
+What changed:
+
+- **A real hourly grid** — `normalise_hourly` floors every timestamp and reindexes onto a complete hourly grid (forward-filling gaps up to 6h, never backwards), so lag, rolling and target windows are true time offsets.
+- **Stationary features** — the model set is now 14 *relative* features (deviations from trailing means, cyclical season and time-of-day) instead of absolute pollutant levels. Raw `day` and `month` are gone from the model set.
+- **Persistence plus a damped correction** — each model predicts the *deviation* from the current AQI, and serving computes `forecast = current AQI + alpha * model output`. A model with no skill now collapses toward persistence instead of toward something worse, which is what made day 3 negative.
+- **`alpha` is fitted, not guessed** — it is the least-squares weight of the correction on a validation window between train and test, then halved. The shrinkage beat the unshrunk fit in **11 of 12** window × horizon combinations tested, including windows it was not chosen on.
+- **Purged, nested evaluation** — train 65% | purge 72 rows | validation 15% | purge 72 rows | test 20%. The test block is still the final 20% of rows, so the reported numbers stay comparable with the previous pipeline.
+- **Skill score** — every horizon also records `skill_vs_persistence` (`1 - MSE/MSE_persistence`), positive only when the model genuinely beats persistence. R² alone is misleading here: in a strongly trending window even a perfect persistence forecast scores below zero.
+
+Result — all three horizons positive, and every one better than before:
+
+| Horizon | R² before | R² after | MAE before | MAE after | Persistence R² | Skill vs persistence |
+|---------|-----------|----------|------------|-----------|----------------|----------------------|
+| Day 1 | +0.7240 | **+0.8572** | 5.27 | 3.84 | +0.8639 | -0.049 |
+| Day 2 | +0.2083 | **+0.5497** | 9.30 | 7.29 | +0.5429 | +0.015 |
+| Day 3 | **-0.0287** | **+0.2575** | 9.92 | 9.51 | +0.2497 | +0.010 |
+
+Two things worth saying plainly, since the skill column sits close to zero:
+
+- **Persistence is most of the forecast.** The learned correction adds a little at day 2 and day 3 and costs a little at day 1. The damping is what keeps it honest — the pipeline can no longer ship a model dramatically worse than doing nothing.
+- **Forecast weather is not the missing ingredient.** This was measured rather than assumed: feeding the models the weather *actually observed* over each target window — a flawless 3-day forecast — was worth only +0.06 skill at day 1 and day 2, and was negative at day 3. The limit is how predictable a 24h-mean AQI is 49-72 hours out from one station's own history, not the weather inputs.
+
 ---
 
 ## 3. What Is Remaining
@@ -137,12 +170,12 @@ The system collects live and historical air quality data, engineers features int
 - [x] ~~Time-based train/test split~~ — 80/20 chronological split (no shuffling); no time-series cross-validation yet.
 - [x] ~~Evaluate with R², RMSE, MAE~~ — best is XGBoost (MAE 8.88, RMSE 11.85, R² 0.46).
 - [x] ~~Persist the trained model~~ — saved as `.pkl` files via `joblib` to `app/models/` (git-ignored, not yet uploaded anywhere durable).
-- [ ] No baseline (naive/persistence) model has been benchmarked against the trained models yet.
+- [x] ~~Benchmark a naive/persistence baseline~~ — every retrain records the persistence baseline's R² and the model's skill score against it, per horizon.
 - [x] ~~Compute SHAP values at training time for dashboard explainability~~ — global mean |SHAP| per horizon, stored with each registry version.
 - [x] ~~Track metrics/feature list alongside the model artifact~~ — the model registry stores metrics, feature list, params, lineage and SHAP importance per version.
 
 ### 🔜 Phase 4 — Forecasting + API
-- [x] ~~72-hour forecasting~~ — implemented as three independent XGBoost models predicting the mean AQI for day 1 / day 2 / day 3 (`lag_feature_engineering_3_days.ipynb`), rather than iterative single-step forecasting. Accuracy drops off fast: Day 1 R² 0.70 → Day 3 R² -0.05, so the day-3 model needs more work (more history, better features, or a different approach) before it's usable.
+- [x] ~~72-hour forecasting~~ — three independent XGBoost models predicting the mean AQI for day 1 / day 2 / day 3, each as a damped correction to persistence. Day 1 R² +0.86 → Day 3 R² +0.26 after the day-3 rework.
 - [ ] AQI category classification (Good / Moderate / Unhealthy / Hazardous) with colour codes.
 - [ ] Wire the trained models into the FastAPI app — `app/main.py` / `app/routes/` still only expose the root and `/health` routes; no inference endpoint exists yet.
 - [ ] New endpoints:
@@ -325,6 +358,7 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | `data` | Lineage: row counts, train/test split, first/last timestamp, missing hourly rows |
 | `run_id`, `git_sha`, `created_at`, `promoted_at` | Which training run and commit produced it, and when it shipped |
 | `explanations` | Global SHAP ranking (mean |SHAP| per feature) for that version, with the sample size and method |
+| `target_transform` | How to turn the model output into a forecast — `{mode: delta_from_anchor, anchor: aqi, alpha: 0.37}`. Absent on versions registered before the day-3 rework, which predicted the level directly |
 | `artifact` | GridFS file id, size, SHA-256 checksum, and whether the binary is still retained |
 
 ### Engineered at training time (notebooks only, not yet in the store)
@@ -332,6 +366,10 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Field | Description |
 |-------|-------------|
 | `aqi_lag_1/3/6/12/24` | AQI value 1/3/6/12/24 hours ago |
+| `aqi_rel_24/72/168` | AQI minus its trailing 24h / 72h / 7-day mean — the model set uses these instead of absolute levels |
+| `aqi_trend_24_72`, `aqi_trend_24_168` | 24h mean minus the 3-day / 7-day mean (which way the level is moving) |
+| `<pollutant>_rel_24/168` | Each pollutant and weather field minus its own trailing mean |
+| `hour_sin/cos`, `doy_sin/cos` | Cyclical time-of-day and season, replacing raw `day` / `month` in the model set |
 | `pm25_lag_1/6/24` | PM2.5 value 1/6/24 hours ago |
 | `aqi_roll_mean_6/12/24` | Rolling mean AQI over the trailing 6/12/24 hours |
 | `aqi_roll_std_24` | Rolling std of AQI over the trailing 24 hours |
@@ -351,7 +389,8 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Exploratory data analysis | ✅ Done |
 | Lag / rolling feature engineering | ✅ Done (notebook-only) |
 | Model training & comparison (24h-ahead, 5 models) | ✅ Done |
-| Day-wise 3-day forecasting (per-horizon XGBoost) | ✅ Done — Day 3 accuracy still weak (R² -0.05) |
+| Day-wise 3-day forecasting (per-horizon XGBoost) | ✅ Done |
+| Day-3 accuracy rework (negative R² fixed) | ✅ Done — Day 3 R² -0.03 → +0.26, all horizons positive |
 | Data quality fixes (AQI definition, dedup, etc.) | 🔜 Pending |
 | Feature engineering module shared by train/serve | 🔜 Pending |
 | Explainability (SHAP) | ✅ Done — global (in the registry) + per-prediction, API + dashboard |

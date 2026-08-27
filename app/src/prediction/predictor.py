@@ -1,16 +1,19 @@
 """
-Serving-side model loading.
+Serving-side model loading and forecasting.
 
-Predictions are served from whatever is in the **production** stage of the
-model registry, so promoting or rolling back a version changes what serving
-uses without a redeploy. Each horizon carries its own feature list from the
-registry, which means a horizon can be retrained on a different feature set
-without breaking the other two.
+Predictions come from whatever is in the **production** stage of the model
+registry, so promoting or rolling back a version changes what serving uses
+without a redeploy. Each horizon carries its own feature list *and its own
+target transform*, so a horizon can be retrained on different features, or
+switched between predicting the AQI level and predicting a correction to
+persistence, without touching the other two.
 
-The git-ignored ``.pkl`` files in ``app/models`` are only a fallback for
-local development and for the moment before the first version is promoted.
+The git-ignored ``.pkl`` files in ``app/models`` are a fallback for local
+development and for the moment before the first version is promoted; the
+metadata written next to them keeps their transforms intact.
 """
 
+import json
 import time
 from pathlib import Path
 
@@ -19,6 +22,8 @@ import joblib
 from app.src.registry import model_registry as registry
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
+
+METADATA_FILENAME = "training_metadata.json"
 
 HORIZONS = ("day1", "day2", "day3")
 
@@ -54,19 +59,47 @@ def _load_from_registry() -> dict:
     }
 
 
+def _local_metadata() -> dict:
+    path = MODEL_DIR / METADATA_FILENAME
+
+    if not path.exists():
+        return {}
+
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def _load_from_disk() -> dict:
     columns = joblib.load(MODEL_DIR / "feature_columns.pkl")
 
-    models = {
-        horizon: joblib.load(MODEL_DIR / f"xgboost_{horizon}.pkl")
-        for horizon in HORIZONS
-    }
+    metadata = _local_metadata()
+
+    transforms = metadata.get("target_transforms", {})
+
+    models = {}
+    features = {}
+    documents = {}
+
+    for horizon in HORIZONS:
+        models[horizon] = joblib.load(MODEL_DIR / f"xgboost_{horizon}.pkl")
+
+        features[horizon] = metadata.get("features") or columns
+
+        documents[horizon] = {
+            "name": f"xgboost_{horizon}",
+            "version": None,
+            "stage": "local file",
+            "features": features[horizon],
+            "target_transform": transforms.get(horizon, {}),
+            "metrics": metadata.get("metrics", {}).get(horizon, {}),
+            "created_at": metadata.get("trained_at"),
+        }
 
     return {
         "source": "local",
         "models": models,
-        "features": {horizon: columns for horizon in HORIZONS},
-        "documents": {},
+        "features": features,
+        "documents": documents,
     }
 
 
@@ -134,6 +167,34 @@ def get_bundle(refresh: bool = False) -> dict:
     return _bundle
 
 
+def anchor_value(document: dict, features_df) -> float:
+    """The persistence value a horizon's correction is applied to."""
+
+    transform = (document or {}).get("target_transform") or {}
+
+    column = transform.get("anchor", "aqi")
+
+    return float(features_df[column].iloc[0])
+
+
+def forecast_horizon(horizon: str, features_df, bundle=None) -> float:
+    """One horizon's AQI forecast, with its target transform applied."""
+
+    bundle = bundle or get_bundle()
+
+    document = bundle["documents"].get(horizon)
+
+    X = features_df[bundle["features"][horizon]]
+
+    raw = float(bundle["models"][horizon].predict(X)[0])
+
+    return float(registry.transform_forecast(
+        (document or {}).get("target_transform"),
+        anchor_value(document, features_df),
+        raw,
+    ))
+
+
 def predict(features_df, refresh: bool = False) -> dict:
     """
     Predict AQI for the next 3 days.
@@ -146,9 +207,7 @@ def predict(features_df, refresh: bool = False) -> dict:
     }
 
     for index, horizon in enumerate(HORIZONS, start=1):
-        X = features_df[bundle["features"][horizon]]
-
-        value = float(bundle["models"][horizon].predict(X)[0])
+        value = forecast_horizon(horizon, features_df, bundle)
 
         forecast[f"day_{index}"] = round(value, 2)
 
@@ -171,7 +230,7 @@ def model_info(refresh: bool = False) -> dict:
             else {
                 "name": f"xgboost_{horizon}",
                 "version": None,
-                "stage": "local file",
+                "stage": "unknown",
                 "metrics": {},
             }
         )

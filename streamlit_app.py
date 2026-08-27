@@ -70,7 +70,27 @@ FEATURE_LABELS = {
     "aqi_roll_mean_6": "AQI 6h mean",
     "aqi_roll_mean_12": "AQI 12h mean",
     "aqi_roll_mean_24": "AQI 24h mean",
+    "aqi_roll_mean_72": "AQI 3-day mean",
+    "aqi_roll_mean_168": "AQI 7-day mean",
     "aqi_roll_std_24": "AQI 24h volatility",
+    "aqi_roll_std_72": "AQI 3-day volatility",
+    "aqi": "AQI now",
+    "aqi_diff_6": "AQI change over 6h",
+    "aqi_diff_24": "AQI change over 24h",
+    "aqi_rel_24": "AQI vs its 24h mean",
+    "aqi_rel_72": "AQI vs its 3-day mean",
+    "aqi_rel_168": "AQI vs its 7-day mean",
+    "aqi_trend_24_72": "24h mean vs 3-day mean",
+    "aqi_trend_24_168": "24h mean vs 7-day mean",
+    "hour_sin": "Time of day",
+    "hour_cos": "Time of day",
+    "doy_sin": "Season",
+    "doy_cos": "Season",
+    "pm25_rel_24": "PM2.5 vs its 24h mean",
+    "pm25_rel_168": "PM2.5 vs its 7-day mean",
+    "o3_rel_168": "Ozone vs its 7-day mean",
+    "co_rel_168": "CO vs its 7-day mean",
+    "no2_rel_168": "NO₂ vs its 7-day mean",
 }
 
 HORIZON_TITLES = {"day1": "Day 1", "day2": "Day 2", "day3": "Day 3"}
@@ -487,6 +507,9 @@ def render_explanation(explanation, model_details, t):
                 + (f" v{version}" if version else "")
                 + f" · {entry.get('method', 'TreeSHAP')}"
             )
+
+            if entry.get("explains"):
+                st.caption(f"Explaining the {entry['explains']}.")
 
             details = (model_details or {}).get(horizon, {})
 

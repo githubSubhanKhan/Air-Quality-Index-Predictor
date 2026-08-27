@@ -44,6 +44,27 @@ STAGE_STAGING = "staging"
 STAGE_PRODUCTION = "production"
 STAGE_ARCHIVED = "archived"
 
+# Target transforms. A model may predict the AQI level directly (no
+# transform), or the deviation from an anchor column, which is how the
+# horizons are trained since the day-3 rework:
+#     forecast = anchor + alpha * model_output
+TRANSFORM_DELTA_FROM_ANCHOR = "delta_from_anchor"
+
+
+def transform_forecast(target_transform: dict, anchor_value, raw_value):
+    """Turn a model's raw output into an AQI forecast."""
+
+    if not target_transform:
+        return raw_value
+
+    if target_transform.get("mode") != TRANSFORM_DELTA_FROM_ANCHOR:
+        return raw_value
+
+    alpha = float(target_transform.get("alpha", 1.0))
+
+    return anchor_value + alpha * raw_value
+
+
 # Metrics where a smaller number is a better model.
 LOWER_IS_BETTER = {"mae", "rmse", "mse"}
 
@@ -116,6 +137,7 @@ def register_model(
     data: dict = None,
     environment: dict = None,
     explanations: dict = None,
+    target_transform: dict = None,
     notes: str = None,
     stage: str = STAGE_STAGING,
 ) -> dict:
@@ -167,6 +189,10 @@ def register_model(
             "data": data or {},
             "environment": environment or {},
             "explanations": explanations or {},
+            # How to turn the model's raw output into an AQI forecast. Absent
+            # or empty means the model predicts the level directly, which is
+            # what versions registered before the day-3 rework do.
+            "target_transform": target_transform or {},
             "git_sha": os.getenv("GITHUB_SHA"),
             "artifact": {
                 "file_id": file_id,
@@ -468,6 +494,7 @@ def summarise(document: dict) -> dict:
         "data": document.get("data", {}),
         "environment": document.get("environment", {}),
         "explanations": document.get("explanations", {}),
+        "target_transform": document.get("target_transform", {}),
         "git_sha": document.get("git_sha"),
         "artifact": {
             "filename": artifact.get("filename"),

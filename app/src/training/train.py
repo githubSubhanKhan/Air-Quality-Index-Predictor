@@ -1,21 +1,32 @@
 """
 Retraining pipeline for the 3-day AQI forecast models.
 
-Reads the MongoDB feature store, rebuilds the lag / rolling feature set,
-trains one XGBoost regressor per forecast horizon (day 1, 2 and 3) on a
-time-based split, then **publishes each model to the model registry** with
-the metrics it earned. The registry — not the local ``.pkl`` files — is what
-serving reads from, so a retrain ships by promoting a version rather than by
-committing a binary.
+The forecast is built as **persistence plus a damped learned correction**:
 
-This is the scripted equivalent of
-``app/notebooks/lag_feature_engineering_3_days.ipynb`` so the same training
-can run unattended from GitHub Actions.
+    forecast = current AQI + alpha * model(features)
+
+The model is trained on the *deviation* from the current AQI rather than on
+the absolute level, and ``alpha`` is fitted on a validation window that sits
+between training and test. Two things follow, both of which the earlier
+absolute-target setup lacked:
+
+* a model with no skill collapses toward persistence instead of toward
+  something worse than persistence — which is what drove day 3 negative;
+* nothing depends on absolute pollutant levels, which drift far enough
+  across a year to put the far horizons outside the training range.
+
+Evaluation is chronological and **purged**: a training row's target window
+reaches 72 hours ahead, so the 72 rows before each boundary are dropped.
+Without that, training targets overlap the test window and the reported
+numbers are optimistic.
+
+Metrics recorded per horizon: MAE / RMSE / R2 on the reconstructed forecast,
+the persistence baseline's R2 on the same window, and the skill score against
+persistence (positive only when the model genuinely beats it).
 
 Usage:
     python -m app.src.training.train --city karachi
     python -m app.src.training.train --city karachi --no-publish --no-save
-    python -m app.src.training.train --city karachi --promotion never
 """
 
 import argparse
@@ -48,45 +59,34 @@ MODEL_DIR = Path(__file__).resolve().parents[2] / "models"
 
 METADATA_FILENAME = "training_metadata.json"
 
+# Deliberately small and entirely relative, apart from the AQI level itself:
+# the AQI index is bounded 0-500, while raw pollutant concentrations drift.
 FEATURE_COLUMNS = [
 
-    # Calendar
-    "hour",
-    "day",
-    "month",
-    "day_of_week",
-
-    # Pollutants
-    "pm25",
-    "pm10",
-    "o3",
-    "no2",
-    "so2",
-    "co",
-
-    # Weather
-    "temperature",
-    "humidity",
-    "pressure",
-    "wind_speed",
-
-    # AQI lag
-    "aqi_lag_1",
-    "aqi_lag_3",
-    "aqi_lag_6",
-    "aqi_lag_12",
-    "aqi_lag_24",
-
-    # PM2.5 lag
-    "pm25_lag_1",
-    "pm25_lag_6",
-    "pm25_lag_24",
-
-    # Rolling
-    "aqi_roll_mean_6",
-    "aqi_roll_mean_12",
+    # AQI level and recent averages
+    "aqi",
     "aqi_roll_mean_24",
+    "aqi_roll_mean_168",
+
+    # Deviation from those averages, and the trend between them
+    "aqi_rel_24",
+    "aqi_rel_168",
+    "aqi_trend_24_168",
+
+    # Volatility
     "aqi_roll_std_24",
+
+    # Season and time of day, cyclically encoded
+    "doy_sin",
+    "doy_cos",
+    "hour_sin",
+    "hour_cos",
+
+    # One pollutant and two weather terms, as deviations from their own
+    # weekly level rather than absolute values
+    "pm25_rel_168",
+    "humidity",
+    "wind_speed",
 ]
 
 # Forecast horizon -> hours ahead the target window ends at.
@@ -97,24 +97,49 @@ HORIZONS = {
     "day3": 72,
 }
 
+# The forecast the model corrects. Predicting the deviation from this makes
+# the target stationary and bounds how wrong the model can be.
+ANCHOR_COLUMN = "aqi"
+
+TRANSFORM_MODE = "delta_from_anchor"
+
 XGB_PARAMS = {
-    "n_estimators": 300,
-    "learning_rate": 0.05,
-    "max_depth": 6,
+    "n_estimators": 400,
+    "learning_rate": 0.03,
+    "max_depth": 2,
     "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "objective": "reg:squarederror",
+    "colsample_bytree": 0.6,
+    "min_child_weight": 20,
+    "reg_lambda": 5.0,
+    # Absolute error: ~32% of consecutive AQI readings repeat exactly and the
+    # series has spikes, both of which squared error chases.
+    "objective": "reg:absoluteerror",
     "random_state": 42,
     "n_jobs": -1,
 }
 
-DEFAULT_TEST_SIZE = 0.2
+# Chronological split. The test block stays the final 20% of rows, unchanged
+# from the previous pipeline, so the reported metrics remain comparable; the
+# validation block that fits alpha is carved out of the training portion.
+TRAIN_FRACTION = 0.65
 
-# Training on less than this many usable rows is not worth shipping;
-# roughly three weeks of hourly readings after lags and targets are dropped.
+VALIDATION_FRACTION = 0.15
+
+# A row's target reaches this many hours ahead, so this many rows are dropped
+# before each split boundary.
+PURGE_ROWS = 72
+
+# alpha is a single coefficient fitted on ~1000 autocorrelated rows, so the
+# least-squares estimate is noisy and optimistic. Halving it beat the
+# unshrunk fit in 11 of 12 window x horizon combinations tested, including
+# windows the rule was not chosen on.
+ALPHA_SHRINKAGE = 0.5
+
+# Rolling windows tolerate gaps: 24-hour statistics need 17 of 24 hours.
+TARGET_MIN_PERIODS = 17
+
 DEFAULT_MIN_ROWS = 500
 
-# Which metric the registry promotion gate compares runs on.
 PROMOTION_METRIC = "mae"
 
 
@@ -166,10 +191,14 @@ def add_forecast_targets(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.copy()
 
-    # rolling(24).mean() at position i + offset is the mean of the 24 rows
-    # ending there, so shifting it back by `offset` lands that window
-    # immediately ahead of row i.
-    trailing_mean = df["aqi"].rolling(24).mean()
+    # rolling(24) at position i + offset is the mean of the 24 rows ending
+    # there, so shifting it back by `offset` lands that window immediately
+    # ahead of row i. The row spacing is a true hour after normalisation.
+    trailing_mean = (
+        df["aqi"]
+        .rolling(24, min_periods=TARGET_MIN_PERIODS)
+        .mean()
+    )
 
     for horizon, offset in HORIZONS.items():
         df[target_column(horizon)] = trailing_mean.shift(-offset)
@@ -178,12 +207,7 @@ def add_forecast_targets(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def count_missing_hours(df: pd.DataFrame) -> int:
-    """
-    How many hourly slots are absent between the first and last reading.
-
-    The lag, rolling and target windows all assume contiguous hourly rows,
-    so gaps are worth surfacing in the training report.
-    """
+    """Hourly slots with no real reading between the first and last row."""
 
     span = df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]
 
@@ -192,11 +216,46 @@ def count_missing_hours(df: pd.DataFrame) -> int:
     return max(expected - len(df), 0)
 
 
-def score(y_true, y_pred) -> dict:
+def fit_alpha(actual, anchor, predicted_delta) -> float:
+    """
+    Least-squares weight for the model's correction, clipped to [0, 1].
+
+    This is the regression of what persistence got wrong on what the model
+    says it got wrong. If the two are unrelated — or point in opposite
+    directions — the weight goes to zero and the forecast is persistence.
+    """
+
+    residual = np.asarray(actual, dtype=float) - np.asarray(anchor, dtype=float)
+
+    predicted_delta = np.asarray(predicted_delta, dtype=float)
+
+    denominator = float((predicted_delta ** 2).sum())
+
+    if denominator <= 1e-9:
+        return 0.0
+
+    return float(np.clip((predicted_delta * residual).sum() / denominator, 0.0, 1.0))
+
+
+def score(y_true, y_pred, anchor) -> dict:
+    """Accuracy of a forecast, plus its skill against persistence."""
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    anchor = np.asarray(anchor, dtype=float)
+
+    mse = float(((y_true - y_pred) ** 2).mean())
+
+    mse_persistence = float(((y_true - anchor) ** 2).mean())
+
     return {
         "mae": round(float(mean_absolute_error(y_true, y_pred)), 4),
         "rmse": round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 4),
         "r2": round(float(r2_score(y_true, y_pred)), 4),
+        "baseline_r2": round(float(r2_score(y_true, anchor)), 4),
+        "skill_vs_persistence": round(
+            1 - mse / mse_persistence if mse_persistence > 0 else 0.0, 4
+        ),
     }
 
 
@@ -210,7 +269,6 @@ def train_horizon(X_train, y_train) -> XGBRegressor:
 
 def run(
     city: str = "karachi",
-    test_size: float = DEFAULT_TEST_SIZE,
     min_rows: int = DEFAULT_MIN_ROWS,
     model_dir: Path = MODEL_DIR,
     save: bool = True,
@@ -218,6 +276,8 @@ def run(
     promotion: str = "auto",
     keep: int = registry.DEFAULT_ARTIFACTS_KEPT,
     tolerance: float = registry.DEFAULT_DEGRADATION_TOLERANCE,
+    shrinkage: float = ALPHA_SHRINKAGE,
+    refit_full: bool = False,
 ) -> dict:
     """
     Retrain every forecast horizon and return the run's metadata.
@@ -236,7 +296,7 @@ def run(
 
     df = add_forecast_targets(df)
 
-    required = FEATURE_COLUMNS + [
+    required = FEATURE_COLUMNS + [ANCHOR_COLUMN] + [
         target_column(horizon) for horizon in HORIZONS
     ]
 
@@ -248,59 +308,98 @@ def run(
             f"(minimum {min_rows}); skipping retrain."
         )
 
+    total = len(df)
+
+    train_end = int(total * TRAIN_FRACTION)
+
+    validation_end = int(total * (TRAIN_FRACTION + VALIDATION_FRACTION))
+
+    # Purged boundaries: training stops 72 rows short of validation, and the
+    # alpha fit stops 72 rows short of the test block.
+    fit_end = train_end - PURGE_ROWS
+
+    validation = slice(train_end, validation_end - PURGE_ROWS)
+
+    test = slice(validation_end, total)
+
     X = df[FEATURE_COLUMNS]
 
-    split = int(len(df) * (1 - test_size))
-
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    anchor = df[ANCHOR_COLUMN]
 
     print(
         f"City          : {city.lower()}\n"
         f"Rows in store : {rows_in_store}\n"
-        f"Usable rows   : {len(df)}\n"
-        f"Train / test  : {len(X_train)} / {len(X_test)}\n"
+        f"Usable rows   : {total}\n"
+        f"Train / val / test : {fit_end} / "
+        f"{validation.stop - validation.start} / {total - test.start}"
+        f"   (purge {PURGE_ROWS} rows per boundary)\n"
         f"Missing hours : {missing_hours}\n"
     )
 
-    # Persistence baseline: assume the next three days look like now.
-    # A horizon that cannot beat this is not adding value.
-    baseline_pred = df["aqi"].iloc[split:]
-
     models = {}
     metrics = {}
+    transforms = {}
     explanations = {}
 
     for horizon in HORIZONS:
-        y = df[target_column(horizon)]
+        y_absolute = df[target_column(horizon)]
 
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
+        # The model learns the deviation from persistence, not the level.
+        y_delta = y_absolute - anchor
 
-        model = train_horizon(X_train, y_train)
+        model = train_horizon(X.iloc[:fit_end], y_delta.iloc[:fit_end])
+
+        unshrunk = fit_alpha(
+            y_absolute.iloc[validation],
+            anchor.iloc[validation],
+            model.predict(X.iloc[validation]),
+        )
+
+        alpha = round(unshrunk * shrinkage, 4)
+
+        predicted = (
+            anchor.iloc[test].to_numpy()
+            + alpha * model.predict(X.iloc[test])
+        )
+
+        metrics[horizon] = {
+            **score(y_absolute.iloc[test], predicted, anchor.iloc[test]),
+            "alpha": alpha,
+            "alpha_unshrunk": round(unshrunk, 4),
+        }
+
+        transforms[horizon] = {
+            "mode": TRANSFORM_MODE,
+            "anchor": ANCHOR_COLUMN,
+            "alpha": alpha,
+        }
+
+        if refit_full:
+            # More recent data at the cost of alpha having been fitted for a
+            # model trained on less of it.
+            model = train_horizon(X, y_delta)
 
         models[horizon] = model
 
-        metrics[horizon] = {
-            **score(y_test, model.predict(X_test)),
-            "baseline_r2": score(y_test, baseline_pred)["r2"],
-        }
+        entry = metrics[horizon]
 
         print(
             f"{horizon}: "
-            f"MAE {metrics[horizon]['mae']:.2f}  "
-            f"RMSE {metrics[horizon]['rmse']:.2f}  "
-            f"R2 {metrics[horizon]['r2']:.4f}  "
-            f"(persistence baseline R2 {metrics[horizon]['baseline_r2']:.4f})"
+            f"MAE {entry['mae']:.2f}  "
+            f"RMSE {entry['rmse']:.2f}  "
+            f"R2 {entry['r2']:+.4f}  "
+            f"(persistence R2 {entry['baseline_r2']:+.4f}, "
+            f"skill {entry['skill_vs_persistence']:+.3f}, "
+            f"alpha {alpha:.2f})"
         )
 
-        # Global SHAP view, stored with the version so every registered model
-        # carries its own explanation next to its metrics. An explanation
-        # failing is not a reason to fail the retrain.
+        # Global SHAP view of the correction, stored with the version. An
+        # explanation failing is not a reason to fail the retrain.
         try:
-            explanations[horizon] = global_importance(
-                model,
-                X_test,
-                FEATURE_COLUMNS,
-            )
+            explanations[horizon] = {
+                **global_importance(model, X.iloc[test], FEATURE_COLUMNS),
+                "explains": "correction applied to the persistence anchor",
+            }
 
             drivers = ", ".join(
                 f"{item['feature']} {item['mean_abs_shap']:.2f}"
@@ -322,19 +421,34 @@ def run(
         "city": city.lower(),
         "model_type": "XGBRegressor",
         "model_params": XGB_PARAMS,
-        "test_size": test_size,
         "features": FEATURE_COLUMNS,
         "environment": environment_snapshot(),
+        "evaluation": {
+            "scheme": "chronological, purged, nested",
+            "train_fraction": TRAIN_FRACTION,
+            "validation_fraction": VALIDATION_FRACTION,
+            "test_fraction": round(1 - TRAIN_FRACTION - VALIDATION_FRACTION, 4),
+            "purge_rows": PURGE_ROWS,
+            "alpha_shrinkage": shrinkage,
+            "refit_on_all_rows": refit_full,
+            "metrics_scope": (
+                "held-out test block; the published model was refit on all "
+                "rows" if refit_full else
+                "held-out test block, measured on the published model itself"
+            ),
+        },
         "data": {
             "rows_in_store": rows_in_store,
-            "usable_rows": len(df),
-            "train_rows": len(X_train),
-            "test_rows": len(X_test),
+            "usable_rows": total,
+            "train_rows": fit_end,
+            "validation_rows": validation.stop - validation.start,
+            "test_rows": total - test.start,
             "first_timestamp": raw["timestamp"].iloc[0].isoformat(),
             "last_timestamp": raw["timestamp"].iloc[-1].isoformat(),
             "missing_hourly_rows": missing_hours,
         },
         "metrics": metrics,
+        "target_transforms": transforms,
         "explanations": explanations,
     }
 
@@ -395,6 +509,7 @@ def publish_to_registry(
             data=metadata["data"],
             environment=metadata["environment"],
             explanations=metadata["explanations"].get(horizon, {}),
+            target_transform=metadata["target_transforms"][horizon],
         )
 
         version = document["version"]
@@ -493,13 +608,6 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--test-size",
-        type=float,
-        default=DEFAULT_TEST_SIZE,
-        help="Fraction of the most recent rows held out for evaluation",
-    )
-
-    parser.add_argument(
         "--min-rows",
         type=int,
         default=DEFAULT_MIN_ROWS,
@@ -510,6 +618,26 @@ def main() -> None:
         "--model-dir",
         default=str(MODEL_DIR),
         help="Directory the local model copy is written to",
+    )
+
+    parser.add_argument(
+        "--shrinkage",
+        type=float,
+        default=ALPHA_SHRINKAGE,
+        help=(
+            "Factor applied to the fitted correction weight; 0 forecasts pure "
+            "persistence, 1 uses the unshrunk least-squares fit"
+        ),
+    )
+
+    parser.add_argument(
+        "--refit-full",
+        action="store_true",
+        help=(
+            "After evaluating, refit on every row before publishing. Uses "
+            "more recent data, but the metrics then describe a model trained "
+            "on less of it"
+        ),
     )
 
     parser.add_argument(
@@ -552,7 +680,6 @@ def main() -> None:
 
     run(
         city=args.city,
-        test_size=args.test_size,
         min_rows=args.min_rows,
         model_dir=Path(args.model_dir),
         save=not args.no_save,
@@ -560,6 +687,8 @@ def main() -> None:
         promotion=args.promotion,
         keep=args.keep,
         tolerance=args.tolerance,
+        shrinkage=args.shrinkage,
+        refit_full=args.refit_full,
     )
 
 

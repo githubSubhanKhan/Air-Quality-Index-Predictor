@@ -19,7 +19,8 @@ booster instead of the whole dashboard losing them.
 import numpy as np
 from xgboost import DMatrix
 
-from app.src.prediction.predictor import HORIZONS, get_bundle
+from app.src.prediction.predictor import HORIZONS, anchor_value, get_bundle
+from app.src.registry import model_registry as registry
 
 METHOD_SHAP = "shap.TreeExplainer"
 
@@ -147,6 +148,45 @@ def explain_row(model, X, columns, top_n: int = DEFAULT_TOP_N) -> dict:
     }
 
 
+def _to_forecast_space(explanation: dict, alpha: float, anchor: float) -> dict:
+    """
+    Move an explanation from correction space into AQI-forecast space.
+
+    The model predicts a deviation that serving damps by ``alpha`` and adds
+    to the anchor, so every contribution scales by the same alpha and the
+    baseline shifts by the anchor. ``base_value`` plus the contributions then
+    reconstructs the forecast the dashboard displays, not the raw deviation.
+    """
+
+    explanation = dict(explanation)
+
+    for contribution in explanation["contributions"]:
+        contribution["contribution"] = round(
+            contribution["contribution"] * alpha, 4
+        )
+
+    explanation["other_contribution"] = round(
+        explanation["other_contribution"] * alpha, 4
+    )
+
+    explanation["base_value"] = round(
+        anchor + alpha * explanation["base_value"], 4
+    )
+
+    explanation["prediction"] = round(
+        anchor + alpha * explanation["prediction"], 4
+    )
+
+    explanation["anchor"] = round(anchor, 4)
+    explanation["alpha"] = alpha
+    explanation["explains"] = (
+        "damped correction to a persistence forecast of "
+        f"{anchor:.1f} AQI"
+    )
+
+    return explanation
+
+
 def explain_prediction(
     features_df,
     horizons=None,
@@ -176,6 +216,15 @@ def explain_prediction(
             columns,
             top_n=top_n,
         )
+
+        transform = (document or {}).get("target_transform") or {}
+
+        if transform.get("mode") == registry.TRANSFORM_DELTA_FROM_ANCHOR:
+            explanation = _to_forecast_space(
+                explanation,
+                float(transform.get("alpha", 1.0)),
+                anchor_value(document, features_df),
+            )
 
         explanation["model"] = {
             "name": document["name"] if document else f"xgboost_{horizon}",
