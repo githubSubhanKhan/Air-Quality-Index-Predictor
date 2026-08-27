@@ -26,3 +26,4 @@ joblib
 xgboost
 scikit-learn
 numpy
+shap

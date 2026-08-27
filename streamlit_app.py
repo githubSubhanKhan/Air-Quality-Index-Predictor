@@ -18,6 +18,7 @@ except Exception:
 
 from app.src.features.feature_store import get_collection
 from app.src.prediction.build_prediction_features import build_prediction_features
+from app.src.explain.explainer import explain_prediction
 from app.src.prediction.predictor import model_info
 from app.src.prediction.predictor import predict as predict_aqi
 
@@ -37,7 +38,46 @@ THEME = dict(
     text_primary="#0b0b0b", text_secondary="#52514e", muted="#898781",
     gridline="#e1e0d9", border="rgba(11,11,11,0.10)", axis="#c3c2b7",
     line="#2a78d6", band_opacity=0.08,
+    # Diverging pair for SHAP contributions, taken from the scale above so the
+    # dashboard stays on one palette: warm = pushes AQI up, cool = pulls down.
+    shap_up="#d03b3b", shap_down="#2a78d6",
 )
+
+# Plain-language names for the model's features, used in the SHAP charts.
+FEATURE_LABELS = {
+    "hour": "Hour of day",
+    "day": "Day of month",
+    "month": "Month",
+    "day_of_week": "Day of week",
+    "pm25": "PM2.5",
+    "pm10": "PM10",
+    "o3": "Ozone",
+    "no2": "NO₂",
+    "so2": "SO₂",
+    "co": "CO",
+    "temperature": "Temperature",
+    "humidity": "Humidity",
+    "pressure": "Pressure",
+    "wind_speed": "Wind speed",
+    "aqi_lag_1": "AQI 1h ago",
+    "aqi_lag_3": "AQI 3h ago",
+    "aqi_lag_6": "AQI 6h ago",
+    "aqi_lag_12": "AQI 12h ago",
+    "aqi_lag_24": "AQI 24h ago",
+    "pm25_lag_1": "PM2.5 1h ago",
+    "pm25_lag_6": "PM2.5 6h ago",
+    "pm25_lag_24": "PM2.5 24h ago",
+    "aqi_roll_mean_6": "AQI 6h mean",
+    "aqi_roll_mean_12": "AQI 12h mean",
+    "aqi_roll_mean_24": "AQI 24h mean",
+    "aqi_roll_std_24": "AQI 24h volatility",
+}
+
+HORIZON_TITLES = {"day1": "Day 1", "day2": "Day 2", "day3": "Day 3"}
+
+
+def feature_label(name):
+    return FEATURE_LABELS.get(name, name.replace("_", " ").capitalize())
 
 POLLUTANT_LABELS = {
     "pm25": "PM2.5",
@@ -85,7 +125,15 @@ def fetch_prediction(city):
     features = build_prediction_features(df)
     forecast = predict_aqi(features)
 
-    return {"city": city, "forecast": forecast}
+    # Explained from the same feature row the forecast came from, so the
+    # contributions always match the numbers on screen.
+    try:
+        explanation = explain_prediction(features)
+    except Exception as exc:
+        print(f"Could not explain the forecast: {exc}")
+        explanation = None
+
+    return {"city": city, "forecast": forecast, "explanation": explanation}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -324,6 +372,128 @@ def render_weather_metrics(latest_reading):
         col.metric(label, f"{value:.1f} {unit}" if value is not None else "—")
 
 
+def build_shap_figure(entry, horizon, t):
+    """One horizon's SHAP contributions as a diverging bar chart."""
+
+    contributions = entry["contributions"]
+
+    # Largest effect at the top: plotly draws the first row at the bottom.
+    rows = list(reversed(contributions))
+
+    labels = [feature_label(row["feature"]) for row in rows]
+    values = [row["contribution"] for row in rows]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=values,
+        y=labels,
+        orientation="h",
+        marker=dict(
+            color=[t["shap_up"] if v > 0 else t["shap_down"] for v in values],
+            cornerradius=4,
+        ),
+        # Signed labels so polarity is readable without relying on colour.
+        text=[f"{v:+.1f}" for v in values],
+        textposition="outside",
+        textfont=dict(color=t["text_secondary"]),
+        customdata=[row["feature_value"] for row in rows],
+        hovertemplate=(
+            "%{y}<br>Current value: %{customdata:.2f}"
+            "<br>Effect: %{x:+.2f} AQI<extra></extra>"
+        ),
+        showlegend=False,
+    ))
+
+    limit = max(abs(v) for v in values) * 1.35 or 1
+    fig.add_vline(x=0, line_color=t["axis"], line_width=1)
+
+    fig.update_layout(
+        title=(
+            f"{HORIZON_TITLES.get(horizon, horizon)}: "
+            f"baseline {entry['base_value']:.1f} → forecast "
+            f"{entry['prediction']:.1f} AQI"
+        ),
+        xaxis_title="Effect on the forecast (AQI points)",
+        height=max(len(rows) * 34 + 130, 260),
+        bargap=0.35,
+    )
+    style_axes(fig, t)
+    fig.update_layout(hovermode="closest")
+    fig.update_xaxes(range=[-limit, limit], showgrid=True, gridcolor=t["gridline"])
+    fig.update_yaxes(showgrid=False)
+    return fig
+
+
+def render_shap_chart(entry, horizon, t):
+    if not entry.get("contributions"):
+        st.info("No contributions available for this horizon.")
+        return
+
+    st.plotly_chart(build_shap_figure(entry, horizon, t), use_container_width=True)
+
+    hidden = entry.get("features_hidden", 0)
+    if hidden:
+        st.caption(
+            f"The other {hidden} features together move the forecast by "
+            f"{entry.get('other_contribution', 0):+.1f} AQI."
+        )
+
+
+def render_global_drivers(entry, top=6):
+    """The model version's overall SHAP ranking, as recorded in the registry."""
+
+    features = entry.get("features", [])
+
+    if not features:
+        return
+
+    st.markdown("**Overall drivers for this model version**")
+
+    for item in features[:top]:
+        st.markdown(
+            f"- {feature_label(item['feature'])} — "
+            f"±{item['mean_abs_shap']:.2f} AQI on average"
+        )
+
+    st.caption(
+        f"Mean absolute SHAP over {entry.get('sample_rows', 0)} "
+        f"evaluation rows ({entry.get('method', 'TreeSHAP')})."
+    )
+
+
+def render_explanation(explanation, model_details, t):
+    """The 'why this forecast' section: one tab per horizon."""
+
+    if not explanation:
+        st.info(
+            "Explanations are unavailable right now — the forecast above is "
+            "unaffected."
+        )
+        return
+
+    horizons = explanation["horizons"]
+
+    tabs = st.tabs([HORIZON_TITLES.get(h, h) for h in horizons])
+
+    for tab, (horizon, entry) in zip(tabs, horizons.items()):
+        with tab:
+            render_shap_chart(entry, horizon, t)
+
+            model = entry.get("model", {})
+            version = model.get("version")
+
+            st.caption(
+                f"{model.get('name', horizon)}"
+                + (f" v{version}" if version else "")
+                + f" · {entry.get('method', 'TreeSHAP')}"
+            )
+
+            details = (model_details or {}).get(horizon, {})
+
+            with st.expander("How this model behaves overall"):
+                render_global_drivers(details.get("explanations", {}))
+
+
 def render_model_provenance(info):
     """Which registry version is serving, and how well it scored."""
 
@@ -437,6 +607,18 @@ def main():
     st.subheader("3-Day Forecast")
     render_forecast_cards(forecast)
     render_forecast_chart(current_aqi, forecast, t)
+
+    st.subheader("Why This Forecast?")
+    st.caption(
+        "SHAP attributes each forecast to the features behind it. A bar shows how "
+        "many AQI points a feature added to or removed from the model's baseline — "
+        "red pushes the forecast up, blue pulls it down."
+    )
+    render_explanation(
+        prediction.get("explanation"),
+        (fetch_model_info() or {}).get("horizons"),
+        t,
+    )
 
     st.subheader("History & Pollutants")
     hist_col, poll_col = st.columns([1.4, 1])

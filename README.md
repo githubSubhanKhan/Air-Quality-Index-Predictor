@@ -106,6 +106,14 @@ The system collects live and historical air quality data, engineers features int
 - `app/src/prediction/predictor.py` — loads the production version of each horizon from the registry and uses **that version's own feature list**, so one horizon can be retrained on different features without breaking the others. The git-ignored `.pkl` files in `app/models/` are only a local-development fallback.
 - The dashboard sidebar shows which versions are serving and what they scored.
 
+### ✅ Explainability (SHAP)
+- `app/src/explain/explainer.py` — TreeSHAP contributions in AQI points, in two flavours:
+  - **Local** — why *this* forecast came out where it did. `base_value` plus the sum of all contributions reconstructs the prediction exactly, so the explanation can be checked against `/predict/{city}`.
+  - **Global** — mean |SHAP| per feature over the evaluation rows. Training computes this per horizon and stores it **in the registry document next to the metrics**, so every registered version carries its own explanation.
+- `shap.TreeExplainer` is the primary path. XGBoost implements the same TreeSHAP algorithm internally (`pred_contribs=True`), so if `shap` is missing or misbehaves, explanations fall back to the booster instead of the dashboard losing them — and a failed explanation never fails a retrain.
+- `app/routes/explain.py` — `GET /explain/{city}` (per-prediction contributions, optional `horizon` and `top`), `GET /explain/global` (the stored global ranking for the production versions).
+- Dashboard — a **Why This Forecast?** section with one tab per horizon: a diverging bar chart of each feature's push on the forecast (red up, blue down, signed labels), the baseline → forecast arithmetic, and an expander with that version's overall drivers from the registry.
+
 ---
 
 ## 3. What Is Remaining
@@ -130,8 +138,8 @@ The system collects live and historical air quality data, engineers features int
 - [x] ~~Evaluate with R², RMSE, MAE~~ — best is XGBoost (MAE 8.88, RMSE 11.85, R² 0.46).
 - [x] ~~Persist the trained model~~ — saved as `.pkl` files via `joblib` to `app/models/` (git-ignored, not yet uploaded anywhere durable).
 - [ ] No baseline (naive/persistence) model has been benchmarked against the trained models yet.
-- [ ] Compute SHAP values at training time for dashboard explainability.
-- [ ] Track metrics/feature list alongside the model artifact (currently only visible inside the notebook output).
+- [x] ~~Compute SHAP values at training time for dashboard explainability~~ — global mean |SHAP| per horizon, stored with each registry version.
+- [x] ~~Track metrics/feature list alongside the model artifact~~ — the model registry stores metrics, feature list, params, lineage and SHAP importance per version.
 
 ### 🔜 Phase 4 — Forecasting + API
 - [x] ~~72-hour forecasting~~ — implemented as three independent XGBoost models predicting the mean AQI for day 1 / day 2 / day 3 (`lag_feature_engineering_3_days.ipynb`), rather than iterative single-step forecasting. Accuracy drops off fast: Day 1 R² 0.70 → Day 3 R² -0.05, so the day-3 model needs more work (more history, better features, or a different approach) before it's usable.
@@ -139,12 +147,12 @@ The system collects live and historical air quality data, engineers features int
 - [ ] Wire the trained models into the FastAPI app — `app/main.py` / `app/routes/` still only expose the root and `/health` routes; no inference endpoint exists yet.
 - [ ] New endpoints:
   - `GET /predict` — current AQI, category, 3-day forecast, last 24h history, model metadata
-  - `GET /shap-values` — feature contributions
+  - [x] ~~`GET /explain/{city}` — feature contributions (SHAP)~~
   - `GET /debug` — model availability and data-range diagnostics
 - [ ] Pydantic response models for each endpoint.
 
 ### 🔜 Phase 5 — Frontend
-- [ ] Dashboard (Streamlit) with: current AQI card, 3-day forecast, hourly history chart, model metrics and SHAP plot.
+- [x] ~~Dashboard (Streamlit) with: current AQI card, 3-day forecast, hourly history chart, model metrics and SHAP plot~~ — all present; model metrics and versions come from the registry.
 
 ### 🔜 Phase 6 — Automation & deployment
 - [x] `.github/workflows/data_pipeline.yml` — runs `pipeline.py` hourly, credentials via GitHub Secrets.
@@ -154,7 +162,7 @@ The system collects live and historical air quality data, engineers features int
 ### 🔜 Phase 7 — Engineering hygiene
 - [ ] Add `.env.example`, tests for `aqi.py` / `build_features.py`, and logging in place of `print`.
 - [x] `requirements.txt` now lists `scikit-learn`, `xgboost`, `joblib` and `numpy`, which the retraining pipeline needs in CI (`lightgbm` is still notebook-only).
-- [ ] Add `shap`, `plotly`, `streamlit` to `requirements.txt` as those phases land.
+- [x] ~~Add `shap`, `plotly`, `streamlit` to `requirements.txt`~~ — all three are pinned.
 - [ ] Remove the vendored `Affan Project/` reference repo from the working tree before final submission.
 
 ---
@@ -167,7 +175,8 @@ Air-Quality-Index-Predictor/
 │   ├── main.py                                     # FastAPI application entry point
 │   ├── routes/
 │   │   ├── health.py                               # /health endpoint
-│   │   └── models.py                               # /models registry endpoints
+│   │   ├── models.py                               # /models registry endpoints
+│   │   └── explain.py                              # /explain SHAP endpoints
 │   ├── models/                                      # Local dev copy of the models (git-ignored; registry is authoritative)
 │   ├── notebooks/
 │   │   ├── eda.ipynb                                # Exploratory data analysis
@@ -189,9 +198,11 @@ Air-Quality-Index-Predictor/
 │       │   └── predictor.py                   # Loads the .pkl models, returns the 3-day forecast
 │       ├── training/
 │       │   └── train.py              # Daily retraining pipeline (CLI)
-│       └── registry/
-│           ├── model_registry.py     # MongoDB/GridFS model registry
-│           └── cli.py                # Registry CLI (list/show/promote/rollback/prune)
+│       ├── registry/
+│       │   ├── model_registry.py     # MongoDB/GridFS model registry
+│       │   └── cli.py                # Registry CLI (list/show/promote/rollback/prune)
+│       └── explain/
+│           └── explainer.py          # SHAP explanations (local + global)
 ├── .github/workflows/
 │   ├── data_pipeline.yml             # Hourly feature pipeline
 │   └── daily_training.yml            # Daily model retraining
@@ -214,7 +225,8 @@ Air-Quality-Index-Predictor/
 | Modelling | scikit-learn (Linear/Ridge/Random Forest), XGBoost, LightGBM, joblib (persistence) |
 | EDA / visualisation | Jupyter, Matplotlib, Seaborn |
 | Config | python-dotenv |
-| Planned | SHAP, Streamlit, GitHub Actions |
+| Explainability | SHAP (TreeSHAP), with XGBoost's `pred_contribs` as the fallback |
+| Frontend / automation | Streamlit, Plotly, GitHub Actions |
 
 ---
 
@@ -312,6 +324,7 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | `params`, `features`, `environment` | Hyperparameters, feature list and library versions used |
 | `data` | Lineage: row counts, train/test split, first/last timestamp, missing hourly rows |
 | `run_id`, `git_sha`, `created_at`, `promoted_at` | Which training run and commit produced it, and when it shipped |
+| `explanations` | Global SHAP ranking (mean |SHAP| per feature) for that version, with the sample size and method |
 | `artifact` | GridFS file id, size, SHA-256 checksum, and whether the binary is still retained |
 
 ### Engineered at training time (notebooks only, not yet in the store)
@@ -341,7 +354,7 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Day-wise 3-day forecasting (per-horizon XGBoost) | ✅ Done — Day 3 accuracy still weak (R² -0.05) |
 | Data quality fixes (AQI definition, dedup, etc.) | 🔜 Pending |
 | Feature engineering module shared by train/serve | 🔜 Pending |
-| Explainability (SHAP) | 🔜 Pending |
+| Explainability (SHAP) | ✅ Done — global (in the registry) + per-prediction, API + dashboard |
 | Prediction API endpoints | 🔜 Pending |
 | Dashboard | 🔜 Pending |
 | GitHub Actions automation | ✅ Done — hourly feature pipeline + daily retraining |

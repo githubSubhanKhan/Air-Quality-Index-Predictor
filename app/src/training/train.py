@@ -37,6 +37,7 @@ from sklearn.metrics import (
 )
 from xgboost import XGBRegressor
 
+from app.src.explain.explainer import global_importance
 from app.src.features.feature_engineering import build_training_features
 from app.src.features.feature_store import get_collection
 from app.src.registry import model_registry as registry
@@ -267,6 +268,7 @@ def run(
 
     models = {}
     metrics = {}
+    explanations = {}
 
     for horizon in HORIZONS:
         y = df[target_column(horizon)]
@@ -290,6 +292,28 @@ def run(
             f"(persistence baseline R2 {metrics[horizon]['baseline_r2']:.4f})"
         )
 
+        # Global SHAP view, stored with the version so every registered model
+        # carries its own explanation next to its metrics. An explanation
+        # failing is not a reason to fail the retrain.
+        try:
+            explanations[horizon] = global_importance(
+                model,
+                X_test,
+                FEATURE_COLUMNS,
+            )
+
+            drivers = ", ".join(
+                f"{item['feature']} {item['mean_abs_shap']:.2f}"
+                for item in explanations[horizon]["features"][:3]
+            )
+
+            print(f"        top SHAP drivers: {drivers}")
+
+        except Exception as exc:
+            print(f"        SHAP importance unavailable: {exc}")
+
+            explanations[horizon] = {}
+
     trained_at = datetime.now(timezone.utc)
 
     metadata = {
@@ -311,6 +335,7 @@ def run(
             "missing_hourly_rows": missing_hours,
         },
         "metrics": metrics,
+        "explanations": explanations,
     }
 
     if publish:
@@ -369,6 +394,7 @@ def publish_to_registry(
             run_id=metadata["run_id"],
             data=metadata["data"],
             environment=metadata["environment"],
+            explanations=metadata["explanations"].get(horizon, {}),
         )
 
         version = document["version"]

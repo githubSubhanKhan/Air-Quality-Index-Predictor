@@ -115,6 +115,7 @@ def register_model(
     run_id: str,
     data: dict = None,
     environment: dict = None,
+    explanations: dict = None,
     notes: str = None,
     stage: str = STAGE_STAGING,
 ) -> dict:
@@ -165,6 +166,7 @@ def register_model(
             "metrics": metrics,
             "data": data or {},
             "environment": environment or {},
+            "explanations": explanations or {},
             "git_sha": os.getenv("GITHUB_SHA"),
             "artifact": {
                 "file_id": file_id,
@@ -465,6 +467,7 @@ def summarise(document: dict) -> dict:
         "feature_count": len(document.get("features", [])),
         "data": document.get("data", {}),
         "environment": document.get("environment", {}),
+        "explanations": document.get("explanations", {}),
         "git_sha": document.get("git_sha"),
         "artifact": {
             "filename": artifact.get("filename"),
