@@ -56,12 +56,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Every horizon trains the whole candidate slate and keeps the winner.
+      # The step log carries the per-horizon comparison tables; run.json feeds
+      # the job summary below.
       - name: Retrain And Publish To Registry
         run: |
           python -m app.src.training.train \
             --city "$CITY" \
             --promotion "$PROMOTION" \
-            --no-save
+            --no-save \
+            --metadata-out run.json
 
       - name: Smoke Test Production Models
         run: |
@@ -103,10 +107,19 @@ jobs:
           print("Forecast:", forecast)
           PY
 
+      - name: Publish Candidate Comparison To Job Summary
+        if: always()
+        run: |
+          if [ -f run.json ]; then
+            python -m app.src.training.report run.json >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No run metadata: the retrain did not get far enough to produce one." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Publish Registry State To Job Summary
         run: |
           {
-            echo "### Model registry after retrain"
+            echo "#### Model registry after retrain"
             echo ""
             echo '```'
             python -m app.src.registry.cli list --limit 12

@@ -1,7 +1,7 @@
 """
 SHAP explanations for the AQI forecasts.
 
-Two kinds of explanation come out of the same TreeSHAP values:
+Two kinds of explanation come out of the same contributions:
 
 * **Local** — why *this* forecast came out where it did. Each feature gets a
   signed contribution in AQI points, and ``base_value + sum(contributions)``
@@ -10,10 +10,30 @@ Two kinds of explanation come out of the same TreeSHAP values:
   over the evaluation rows. Training records this in the model registry, so
   every registered version carries its own explanation next to its metrics.
 
-``shap.TreeExplainer`` is the primary path. XGBoost implements the same
-TreeSHAP algorithm internally (``pred_contribs=True``), so if ``shap`` is not
-installed — or a version of it misbehaves — explanations still work from the
-booster instead of the whole dashboard losing them.
+Because training picks a winner from a candidate slate (see
+``app/src/training/candidates.py``), the estimator behind a horizon is not
+necessarily a tree. The right method is chosen from what the fitted estimator
+exposes rather than from anything recorded alongside it, so artifacts
+registered before selection existed — and the local ``.pkl`` fallback — are
+explained the same way:
+
+* **linear** (anything whose final step has ``coef_``) — exact contributions,
+  ``coef_j * z_j``, computed after the pipeline's own preprocessing. The
+  candidate slate standardises features before Ridge, and ``StandardScaler``
+  centres on the training mean, so ``z = 0`` *is* the training mean: the
+  contributions are measured against the average row and ``intercept_`` is
+  the baseline. (A linear model fitted without a scaler still reconstructs
+  its prediction exactly, but its baseline is the origin rather than the
+  data mean.)
+* **tree** — ``shap.TreeExplainer``, which covers XGBoost, Random Forest and
+  HistGradientBoosting. XGBoost implements the same TreeSHAP algorithm
+  internally (``pred_contribs=True``), so if ``shap`` is not installed — or a
+  version of it misbehaves — XGBoost explanations still work from the booster
+  instead of the whole dashboard losing them.
+* **anything else**, including the ``persistence`` reference model — zero
+  contributions against a baseline equal to the prediction. The identity
+  above still holds, and the reported method says plainly that no feature
+  attribution was possible, rather than the caller raising.
 """
 
 import numpy as np
@@ -25,6 +45,10 @@ from app.src.registry import model_registry as registry
 METHOD_SHAP = "shap.TreeExplainer"
 
 METHOD_BOOSTER = "xgboost.pred_contribs"
+
+METHOD_LINEAR = "linear.exact"
+
+METHOD_NONE = "unavailable.no_attribution"
 
 # Features shown per explanation before the rest are folded away.
 DEFAULT_TOP_N = 8
@@ -38,8 +62,33 @@ _explainers = {}
 _shap_available = None
 
 
+def _final_estimator(model):
+    """The estimator at the end of a pipeline, or the model itself."""
+
+    steps = getattr(model, "steps", None)
+
+    return steps[-1][1] if steps else model
+
+
+def _preprocess(model, X):
+    """``X`` as the final estimator sees it, with pipeline steps applied."""
+
+    steps = getattr(model, "steps", None)
+
+    if not steps or len(steps) < 2:
+        return X
+
+    return model[:-1].transform(X)
+
+
 def _tree_explainer(model):
-    """A cached ``shap.TreeExplainer``, or None if shap is unavailable."""
+    """
+    A cached ``shap.TreeExplainer``, or None if it cannot explain this model.
+
+    Failures are cached too: the dispatch below calls this on every row of
+    every request, and re-raising inside shap for a model it will never
+    support is not free.
+    """
 
     global _shap_available
 
@@ -63,20 +112,75 @@ def _tree_explainer(model):
 
     _shap_available = True
 
-    explainer = shap.TreeExplainer(model)
+    try:
+        explainer = shap.TreeExplainer(model)
+
+    except Exception:
+        explainer = None
 
     _explainers[key] = (model, explainer)
 
     return explainer
 
 
+def _linear_contributions(model, X):
+    """Exact per-feature contributions for a linear model."""
+
+    estimator = _final_estimator(model)
+
+    transformed = np.asarray(_preprocess(model, X), dtype=float)
+
+    coefficients = np.asarray(estimator.coef_, dtype=float).ravel()
+
+    intercept = float(np.asarray(estimator.intercept_, dtype=float).ravel()[0])
+
+    values = transformed * coefficients
+
+    return values, np.full(len(X), intercept), METHOD_LINEAR
+
+
+def _no_contributions(model, X):
+    """
+    Zero attribution, with the prediction itself as the baseline.
+
+    Used for models with no notion of feature effect — the ``persistence``
+    reference candidate, in practice. Keeps the reconstruction identity
+    ``base_value + sum(contributions) == prediction`` true for callers.
+    """
+
+    predictions = np.asarray(model.predict(X), dtype=float).ravel()
+
+    values = np.zeros((len(X), X.shape[1]), dtype=float)
+
+    return values, predictions, METHOD_NONE
+
+
+def _booster_contributions(model, X):
+    """XGBoost's own TreeSHAP, used when shap is unavailable or fails."""
+
+    contributions = np.asarray(
+        model.get_booster().predict(DMatrix(X), pred_contribs=True),
+        dtype=float,
+    )
+
+    # The last column is the bias term, i.e. the expected value.
+    return contributions[:, :-1], contributions[:, -1], METHOD_BOOSTER
+
+
 def shap_contributions(model, X):
     """
-    TreeSHAP contributions for every row of ``X``.
+    Per-feature contributions for every row of ``X``.
 
     Returns ``(values, base_values, method)`` where ``values`` has shape
-    ``(rows, features)`` and ``base_values`` has one entry per row.
+    ``(rows, features)`` and ``base_values`` has one entry per row. For every
+    method, ``base_values[i] + values[i].sum()`` is the model's prediction for
+    row ``i``.
     """
+
+    estimator = _final_estimator(model)
+
+    if hasattr(estimator, "coef_"):
+        return _linear_contributions(model, X)
 
     explainer = _tree_explainer(model)
 
@@ -93,16 +197,22 @@ def shap_contributions(model, X):
         except Exception as exc:
             print(
                 f"shap.TreeExplainer failed ({exc}); "
-                f"falling back to XGBoost's own TreeSHAP"
+                f"trying XGBoost's own TreeSHAP"
             )
 
-    contributions = np.asarray(
-        model.get_booster().predict(DMatrix(X), pred_contribs=True),
-        dtype=float,
+    if hasattr(estimator, "get_booster"):
+        try:
+            return _booster_contributions(estimator, X)
+
+        except Exception as exc:
+            print(f"XGBoost TreeSHAP failed ({exc})")
+
+    print(
+        f"No feature attribution available for "
+        f"{type(estimator).__name__}; reporting zero contributions"
     )
 
-    # The last column is the bias term, i.e. the expected value.
-    return contributions[:, :-1], contributions[:, -1], METHOD_BOOSTER
+    return _no_contributions(model, X)
 
 
 def explain_row(model, X, columns, top_n: int = DEFAULT_TOP_N) -> dict:
@@ -229,6 +339,8 @@ def explain_prediction(
         explanation["model"] = {
             "name": document["name"] if document else f"xgboost_{horizon}",
             "version": document["version"] if document else None,
+            "candidate": (document or {}).get("candidate"),
+            "model_type": (document or {}).get("model_type"),
         }
 
         explanations[horizon] = explanation

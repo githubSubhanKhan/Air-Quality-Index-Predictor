@@ -83,7 +83,18 @@ _indexes_ready = False
 
 
 def model_name(horizon: str) -> str:
-    """Registry name for a forecast horizon, e.g. day1 -> aqi_xgboost_day1."""
+    """
+    Registry name for a forecast horizon, e.g. day1 -> aqi_xgboost_day1.
+
+    This is a **slot** name, not a claim about the estimator inside it. Since
+    training picks a winner from a candidate slate per retrain, the model
+    serving ``aqi_xgboost_day1`` may be a Ridge or a Random Forest; the
+    ``candidate``, ``model_family`` and ``model_type`` fields on the document
+    say which. The name is deliberately fixed because version numbers,
+    promotion history and rollback are all keyed on it — renaming per family
+    would restart numbering, leave the promotion gate with no incumbent to
+    compare against, and orphan the metric history.
+    """
 
     return f"aqi_xgboost_{horizon}"
 
@@ -138,6 +149,10 @@ def register_model(
     environment: dict = None,
     explanations: dict = None,
     target_transform: dict = None,
+    candidate: str = None,
+    model_family: str = None,
+    model_type: str = None,
+    selection: dict = None,
     notes: str = None,
     stage: str = STAGE_STAGING,
 ) -> dict:
@@ -182,7 +197,17 @@ def register_model(
             "city": city.lower(),
             "horizon": horizon,
             "run_id": run_id,
-            "model_type": type(model).__name__,
+            # `model_type` is the estimator class; `candidate` is the slate
+            # entry it came from (see app/src/training/candidates.py) and is
+            # the stable name to group a family's history by, since the
+            # estimator class can change without the family changing.
+            "model_type": model_type or type(model).__name__,
+            "candidate": candidate,
+            "model_family": model_family,
+            # How the winner was chosen for this version, including every
+            # candidate's metrics. Recorded so the comparison behind the
+            # choice survives the run that made it.
+            "selection": selection or {},
             "params": params,
             "features": features,
             "metrics": metrics,
@@ -472,13 +497,24 @@ def prune_artifacts(name: str, keep: int = DEFAULT_ARTIFACTS_KEPT) -> int:
     return pruned
 
 
-def summarise(document: dict) -> dict:
-    """A JSON-safe view of a registry document, without the raw ids."""
+def summarise(document: dict, full: bool = False) -> dict:
+    """
+    A JSON-safe view of a registry document, without the raw ids.
+
+    ``full`` adds the per-candidate comparison table the winner was chosen
+    from. It is left out by default because list endpoints return many
+    versions at once and the table is the largest field on a document.
+    """
 
     if document is None:
         return None
 
     artifact = document.get("artifact", {})
+
+    selection = dict(document.get("selection", {}))
+
+    if not full:
+        selection.pop("comparison", None)
 
     return {
         "name": document["name"],
@@ -488,6 +524,9 @@ def summarise(document: dict) -> dict:
         "horizon": document.get("horizon"),
         "run_id": document.get("run_id"),
         "model_type": document.get("model_type"),
+        "candidate": document.get("candidate"),
+        "model_family": document.get("model_family"),
+        "selection": selection,
         "metrics": document.get("metrics", {}),
         "params": document.get("params", {}),
         "feature_count": len(document.get("features", [])),

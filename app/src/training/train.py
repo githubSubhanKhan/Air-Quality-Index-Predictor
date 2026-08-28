@@ -15,6 +15,14 @@ absolute-target setup lacked:
 * nothing depends on absolute pollutant levels, which drift far enough
   across a year to put the far horizons outside the training range.
 
+**Which** model provides that correction is decided per retrain, not assumed.
+Every horizon trains the candidate slate in ``candidates.py`` — persistence,
+Ridge, Random Forest, HistGradientBoosting, XGBoost — and keeps whichever wins
+on the validation window, subject to a margin that stops the served family
+flip-flopping on noise. All five candidates' metrics are recorded with the
+version, so the comparison behind the choice is auditable after the fact
+rather than living in a notebook that was run once.
+
 Evaluation is chronological and **purged**: a training row's target window
 reaches 72 hours ahead, so the 72 rows before each boundary are dropped.
 Without that, training targets overlap the test window and the reported
@@ -27,6 +35,8 @@ persistence (positive only when the model genuinely beats it).
 Usage:
     python -m app.src.training.train --city karachi
     python -m app.src.training.train --city karachi --no-publish --no-save
+    python -m app.src.training.train --candidates xgboost --no-publish
+    python -m app.src.training.train --candidates all --allow-baseline
 """
 
 import argparse
@@ -36,22 +46,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
-import numpy as np
 import pandas as pd
 import sklearn
 import xgboost
 from dotenv import load_dotenv
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
-)
-from xgboost import XGBRegressor
 
 from app.src.explain.explainer import global_importance
 from app.src.features.feature_engineering import build_training_features
 from app.src.features.feature_store import get_collection
 from app.src.registry import model_registry as registry
+from app.src.training import candidates as zoo
+from app.src.training import selection
 
 load_dotenv()
 
@@ -103,24 +108,10 @@ ANCHOR_COLUMN = "aqi"
 
 TRANSFORM_MODE = "delta_from_anchor"
 
-XGB_PARAMS = {
-    "n_estimators": 400,
-    "learning_rate": 0.03,
-    "max_depth": 2,
-    "subsample": 0.8,
-    "colsample_bytree": 0.6,
-    "min_child_weight": 20,
-    "reg_lambda": 5.0,
-    # Absolute error: ~32% of consecutive AQI readings repeat exactly and the
-    # series has spikes, both of which squared error chases.
-    "objective": "reg:absoluteerror",
-    "random_state": 42,
-    "n_jobs": -1,
-}
-
 # Chronological split. The test block stays the final 20% of rows, unchanged
 # from the previous pipeline, so the reported metrics remain comparable; the
-# validation block that fits alpha is carved out of the training portion.
+# validation block that fits alpha and ranks the candidates is carved out of
+# the training portion.
 TRAIN_FRACTION = 0.65
 
 VALIDATION_FRACTION = 0.15
@@ -145,6 +136,10 @@ PROMOTION_METRIC = "mae"
 
 def target_column(horizon: str) -> str:
     return f"target_{horizon}"
+
+
+def artifact_filename(horizon: str) -> str:
+    return f"model_{horizon}.pkl"
 
 
 def environment_snapshot() -> dict:
@@ -216,57 +211,6 @@ def count_missing_hours(df: pd.DataFrame) -> int:
     return max(expected - len(df), 0)
 
 
-def fit_alpha(actual, anchor, predicted_delta) -> float:
-    """
-    Least-squares weight for the model's correction, clipped to [0, 1].
-
-    This is the regression of what persistence got wrong on what the model
-    says it got wrong. If the two are unrelated — or point in opposite
-    directions — the weight goes to zero and the forecast is persistence.
-    """
-
-    residual = np.asarray(actual, dtype=float) - np.asarray(anchor, dtype=float)
-
-    predicted_delta = np.asarray(predicted_delta, dtype=float)
-
-    denominator = float((predicted_delta ** 2).sum())
-
-    if denominator <= 1e-9:
-        return 0.0
-
-    return float(np.clip((predicted_delta * residual).sum() / denominator, 0.0, 1.0))
-
-
-def score(y_true, y_pred, anchor) -> dict:
-    """Accuracy of a forecast, plus its skill against persistence."""
-
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    anchor = np.asarray(anchor, dtype=float)
-
-    mse = float(((y_true - y_pred) ** 2).mean())
-
-    mse_persistence = float(((y_true - anchor) ** 2).mean())
-
-    return {
-        "mae": round(float(mean_absolute_error(y_true, y_pred)), 4),
-        "rmse": round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 4),
-        "r2": round(float(r2_score(y_true, y_pred)), 4),
-        "baseline_r2": round(float(r2_score(y_true, anchor)), 4),
-        "skill_vs_persistence": round(
-            1 - mse / mse_persistence if mse_persistence > 0 else 0.0, 4
-        ),
-    }
-
-
-def train_horizon(X_train, y_train) -> XGBRegressor:
-    model = XGBRegressor(**XGB_PARAMS)
-
-    model.fit(X_train, y_train)
-
-    return model
-
-
 def run(
     city: str = "karachi",
     min_rows: int = DEFAULT_MIN_ROWS,
@@ -278,6 +222,11 @@ def run(
     tolerance: float = registry.DEFAULT_DEGRADATION_TOLERANCE,
     shrinkage: float = ALPHA_SHRINKAGE,
     refit_full: bool = False,
+    slate=None,
+    select_metric: str = selection.DEFAULT_SELECTION_METRIC,
+    select_margin: float = selection.DEFAULT_SELECTION_MARGIN,
+    default_model: str = zoo.DEFAULT_MODEL,
+    allow_baseline: bool = False,
 ) -> dict:
     """
     Retrain every forecast horizon and return the run's metadata.
@@ -285,6 +234,8 @@ def run(
     Nothing is published until all three horizons have trained, so a failure
     part-way through leaves the current production models serving.
     """
+
+    candidate_slate = zoo.resolve_slate(slate)
 
     raw = load_feature_store(city)
 
@@ -315,7 +266,7 @@ def run(
     validation_end = int(total * (TRAIN_FRACTION + VALIDATION_FRACTION))
 
     # Purged boundaries: training stops 72 rows short of validation, and the
-    # alpha fit stops 72 rows short of the test block.
+    # alpha fit and candidate ranking stop 72 rows short of the test block.
     fit_end = train_end - PURGE_ROWS
 
     validation = slice(train_end, validation_end - PURGE_ROWS)
@@ -334,38 +285,69 @@ def run(
         f"{validation.stop - validation.start} / {total - test.start}"
         f"   (purge {PURGE_ROWS} rows per boundary)\n"
         f"Missing hours : {missing_hours}\n"
+        f"Candidates    : {', '.join(c.name for c in candidate_slate)}\n"
+        f"Selection     : validation {select_metric}, "
+        f"{select_margin:.1%} margin over '{default_model}'"
+        f"{'' if allow_baseline else ', reference models excluded'}\n"
     )
 
     models = {}
     metrics = {}
     transforms = {}
     explanations = {}
+    chosen = {}
+    comparisons = {}
 
     for horizon in HORIZONS:
+        print(f"{horizon}")
+
         y_absolute = df[target_column(horizon)]
 
-        # The model learns the deviation from persistence, not the level.
-        y_delta = y_absolute - anchor
-
-        model = train_horizon(X.iloc[:fit_end], y_delta.iloc[:fit_end])
-
-        unshrunk = fit_alpha(
-            y_absolute.iloc[validation],
-            anchor.iloc[validation],
-            model.predict(X.iloc[validation]),
+        trials = selection.evaluate_slate(
+            candidate_slate,
+            X,
+            y_absolute,
+            anchor,
+            fit_end,
+            validation,
+            test,
+            shrinkage,
         )
 
-        alpha = round(unshrunk * shrinkage, 4)
-
-        predicted = (
-            anchor.iloc[test].to_numpy()
-            + alpha * model.predict(X.iloc[test])
+        winner, reason = selection.select(
+            trials,
+            metric=select_metric,
+            margin=select_margin,
+            default_model=default_model,
+            allow_baseline=allow_baseline,
         )
+
+        winner.selected = True
+
+        print(selection.comparison_table(trials, metric=select_metric))
+
+        print(f"        selected {winner.candidate.name}: {reason}")
+
+        comparisons[horizon] = [trial.record() for trial in trials]
+
+        model = winner.model
+
+        alpha = winner.alpha
+
+        if refit_full:
+            # More recent data at the cost of alpha having been fitted for a
+            # model trained on less of it.
+            model = winner.candidate.build()
+
+            model.fit(X, y_absolute - anchor)
+
+        models[horizon] = model
 
         metrics[horizon] = {
-            **score(y_absolute.iloc[test], predicted, anchor.iloc[test]),
+            **winner.test,
             "alpha": alpha,
-            "alpha_unshrunk": round(unshrunk, 4),
+            "alpha_unshrunk": winner.alpha_unshrunk,
+            "validation": winner.validation,
         }
 
         transforms[horizon] = {
@@ -374,17 +356,21 @@ def run(
             "alpha": alpha,
         }
 
-        if refit_full:
-            # More recent data at the cost of alpha having been fitted for a
-            # model trained on less of it.
-            model = train_horizon(X, y_delta)
+        chosen[horizon] = {
+            "candidate": winner.candidate.name,
+            "label": winner.candidate.label,
+            "family": winner.candidate.family,
+            "model_type": type(model).__name__,
+            "params": dict(winner.candidate.params),
+            "alpha": alpha,
+            "reason": reason,
+            "notes": winner.notes,
+        }
 
-        models[horizon] = model
-
-        entry = metrics[horizon]
+        entry = winner.test
 
         print(
-            f"{horizon}: "
+            f"        winner: "
             f"MAE {entry['mae']:.2f}  "
             f"RMSE {entry['rmse']:.2f}  "
             f"R2 {entry['r2']:+.4f}  "
@@ -406,10 +392,10 @@ def run(
                 for item in explanations[horizon]["features"][:3]
             )
 
-            print(f"        top SHAP drivers: {drivers}")
+            print(f"        top SHAP drivers: {drivers}\n")
 
         except Exception as exc:
-            print(f"        SHAP importance unavailable: {exc}")
+            print(f"        SHAP importance unavailable: {exc}\n")
 
             explanations[horizon] = {}
 
@@ -419,8 +405,7 @@ def run(
         "run_id": trained_at.strftime("%Y%m%dT%H%M%SZ"),
         "trained_at": trained_at.isoformat(timespec="seconds"),
         "city": city.lower(),
-        "model_type": "XGBRegressor",
-        "model_params": XGB_PARAMS,
+        "models": chosen,
         "features": FEATURE_COLUMNS,
         "environment": environment_snapshot(),
         "evaluation": {
@@ -436,6 +421,19 @@ def run(
                 "rows" if refit_full else
                 "held-out test block, measured on the published model itself"
             ),
+            "selection": {
+                "slate": [c.name for c in candidate_slate],
+                "metric": select_metric,
+                "scope": "validation block",
+                "margin": select_margin,
+                "default_model": default_model,
+                "reference_models_eligible": allow_baseline,
+                "note": (
+                    "Candidates were ranked on the validation block only. "
+                    "Test metrics are reported for every candidate but took "
+                    "no part in the choice."
+                ),
+            },
         },
         "data": {
             "rows_in_store": rows_in_store,
@@ -448,6 +446,7 @@ def run(
             "missing_hourly_rows": missing_hours,
         },
         "metrics": metrics,
+        "candidates": comparisons,
         "target_transforms": transforms,
         "explanations": explanations,
     }
@@ -461,7 +460,7 @@ def run(
             tolerance=tolerance,
         )
     else:
-        print("\n--no-publish set: models were not sent to the registry.")
+        print("--no-publish set: models were not sent to the registry.")
 
     if save:
         save_artifacts(models, metadata, model_dir)
@@ -497,11 +496,13 @@ def publish_to_registry(
 
         incumbent = registry.get_production(name)
 
+        chosen = metadata["models"][horizon]
+
         document = registry.register_model(
             name,
             model,
             metrics=metadata["metrics"][horizon],
-            params=metadata["model_params"],
+            params=chosen["params"],
             features=metadata["features"],
             city=metadata["city"],
             horizon=horizon,
@@ -510,6 +511,14 @@ def publish_to_registry(
             environment=metadata["environment"],
             explanations=metadata["explanations"].get(horizon, {}),
             target_transform=metadata["target_transforms"][horizon],
+            candidate=chosen["candidate"],
+            model_family=chosen["family"],
+            model_type=chosen["model_type"],
+            selection={
+                **metadata["evaluation"]["selection"],
+                "reason": chosen["reason"],
+                "comparison": metadata["candidates"][horizon],
+            },
         )
 
         version = document["version"]
@@ -537,6 +546,7 @@ def publish_to_registry(
             "name": name,
             "version": version,
             "stage": document["stage"],
+            "candidate": chosen["candidate"],
             "promoted": promote,
             "reason": reason,
             "previous_production_version": (
@@ -546,7 +556,8 @@ def publish_to_registry(
         }
 
         print(
-            f"  {name} v{version} -> {document['stage']} ({reason})"
+            f"  {name} v{version} [{chosen['candidate']}] "
+            f"-> {document['stage']} ({reason})"
             + (f"; pruned {pruned} old artifact(s)" if pruned else "")
         )
 
@@ -578,7 +589,7 @@ def save_artifacts(
     artifacts = {}
 
     for horizon, model in models.items():
-        filename = f"xgboost_{horizon}.pkl"
+        filename = artifact_filename(horizon)
 
         joblib.dump(model, model_dir / filename)
 
@@ -621,6 +632,51 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--candidates",
+        default=",".join(zoo.DEFAULT_SLATE),
+        help=(
+            "Comma-separated candidates to evaluate per horizon, or 'all'. "
+            f"Available: {', '.join(sorted(zoo.CANDIDATES))}"
+        ),
+    )
+
+    parser.add_argument(
+        "--select-metric",
+        default=selection.DEFAULT_SELECTION_METRIC,
+        choices=["mae", "rmse", "r2", "skill_vs_persistence"],
+        help="Validation metric the winning candidate is chosen on",
+    )
+
+    parser.add_argument(
+        "--select-margin",
+        type=float,
+        default=selection.DEFAULT_SELECTION_MARGIN,
+        help=(
+            "Relative improvement a challenger needs over "
+            f"'{zoo.DEFAULT_MODEL}' before it takes the slot, e.g. 0.02 for 2%%"
+        ),
+    )
+
+    parser.add_argument(
+        "--default-model",
+        default=zoo.DEFAULT_MODEL,
+        help=(
+            "The incumbent candidate: it wins ties and keeps the slot unless "
+            "a challenger clears --select-margin"
+        ),
+    )
+
+    parser.add_argument(
+        "--allow-baseline",
+        action="store_true",
+        help=(
+            "Let reference candidates such as 'persistence' win a slot. They "
+            "are always evaluated; by default they cannot be selected, "
+            "because a constant model has no SHAP explanation to show"
+        ),
+    )
+
+    parser.add_argument(
         "--shrinkage",
         type=float,
         default=ALPHA_SHRINKAGE,
@@ -634,9 +690,9 @@ def main() -> None:
         "--refit-full",
         action="store_true",
         help=(
-            "After evaluating, refit on every row before publishing. Uses "
-            "more recent data, but the metrics then describe a model trained "
-            "on less of it"
+            "After evaluating, refit the winner on every row before "
+            "publishing. Uses more recent data, but the metrics then describe "
+            "a model trained on less of it"
         ),
     )
 
@@ -644,6 +700,15 @@ def main() -> None:
         "--no-save",
         action="store_true",
         help="Skip the local .pkl copy",
+    )
+
+    parser.add_argument(
+        "--metadata-out",
+        default=None,
+        help=(
+            "Also write this run's metadata as JSON to this path, regardless "
+            "of --no-save. Feeds `python -m app.src.training.report`"
+        ),
     )
 
     parser.add_argument(
@@ -678,7 +743,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    run(
+    metadata = run(
         city=args.city,
         min_rows=args.min_rows,
         model_dir=Path(args.model_dir),
@@ -689,7 +754,22 @@ def main() -> None:
         tolerance=args.tolerance,
         shrinkage=args.shrinkage,
         refit_full=args.refit_full,
+        slate=args.candidates,
+        select_metric=args.select_metric,
+        select_margin=args.select_margin,
+        default_model=args.default_model,
+        allow_baseline=args.allow_baseline,
     )
+
+    if args.metadata_out:
+        path = Path(args.metadata_out)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        print(f"Wrote run metadata to {path}")
 
 
 if __name__ == "__main__":

@@ -59,6 +59,24 @@ def _load_from_registry() -> dict:
     }
 
 
+def _local_artifact(horizon: str) -> Path:
+    """
+    The local .pkl for a horizon.
+
+    Training writes ``model_<horizon>.pkl``, since the estimator inside is
+    whichever candidate won and is not necessarily XGBoost. The older
+    ``xgboost_<horizon>.pkl`` name is still accepted so a working tree that
+    has not been retrained since keeps serving.
+    """
+
+    current = MODEL_DIR / f"model_{horizon}.pkl"
+
+    if current.exists():
+        return current
+
+    return MODEL_DIR / f"xgboost_{horizon}.pkl"
+
+
 def _local_metadata() -> dict:
     path = MODEL_DIR / METADATA_FILENAME
 
@@ -80,8 +98,10 @@ def _load_from_disk() -> dict:
     features = {}
     documents = {}
 
+    chosen = metadata.get("models", {})
+
     for horizon in HORIZONS:
-        models[horizon] = joblib.load(MODEL_DIR / f"xgboost_{horizon}.pkl")
+        models[horizon] = joblib.load(_local_artifact(horizon))
 
         features[horizon] = metadata.get("features") or columns
 
@@ -92,6 +112,9 @@ def _load_from_disk() -> dict:
             "features": features[horizon],
             "target_transform": transforms.get(horizon, {}),
             "metrics": metadata.get("metrics", {}).get(horizon, {}),
+            "candidate": chosen.get(horizon, {}).get("candidate"),
+            "model_family": chosen.get(horizon, {}).get("family"),
+            "model_type": chosen.get(horizon, {}).get("model_type"),
             "created_at": metadata.get("trained_at"),
         }
 

@@ -87,7 +87,39 @@ The system collects live and historical air quality data, engineers features int
 - `.github/workflows/data_pipeline.yml` — runs `app.src.features.pipeline` every hour with API keys and the MongoDB URI supplied through GitHub Secrets, so the feature store keeps growing without manual runs.
 
 ### ✅ Automated daily retraining (GitHub Actions)
-- `app/src/training/train.py` — retraining runs unattended: loads the city's rows from the feature store, rebuilds features via the shared `feature_engineering` module, recreates the `target_day1/2/3` windows, trains one XGBoost regressor per horizon on a purged chronological split, and publishes only after all three have trained (a mid-run failure leaves the production models serving).
+- `app/src/training/train.py` — retraining runs unattended: loads the city's rows from the feature store, rebuilds features via the shared `feature_engineering` module, recreates the `target_day1/2/3` windows, trains the candidate slate per horizon on a purged chronological split, and publishes only after all three have trained (a mid-run failure leaves the production models serving).
+
+### ✅ Automated model selection per retrain
+Previously the pipeline trained one XGBoost per horizon and took the five-model comparison in `lag_feature_engineering.ipynb` as justification — but that comparison was run once, against a different target (24h-ahead *absolute* AQI on 26 features), and nothing re-checked it after the horizons moved to a damped correction on 14 features.
+
+Every retrain now trains a **candidate slate** per horizon and keeps the winner:
+
+| Candidate | Family | Estimator |
+|---|---|---|
+| `persistence` | constant | `DummyRegressor` — the null model, reference only |
+| `ridge` | linear | `StandardScaler` + `Ridge` |
+| `random_forest` | tree | `RandomForestRegressor` |
+| `hist_gbm` | tree | `HistGradientBoostingRegressor` |
+| `xgboost` | tree | `XGBRegressor` — the incumbent |
+
+- **Defined in** `app/src/training/candidates.py`; evaluation and the selection rule in `app/src/training/selection.py`.
+- **Selection is on the validation block only.** Train fits, validation fits each candidate's `alpha` *and* ranks the candidates, test is scored once and never consulted before the choice. Test metrics are recorded for every candidate for the write-up, but took no part in the decision — on day 3, `random_forest` in fact edges `hist_gbm` on test while losing on validation, which is exactly the honesty this protocol buys.
+- **A 2% margin guards the incumbent.** A challenger must beat `xgboost` by 2% on validation MAE to take the slot, so the served family does not flip between daily retrains on differences inside the noise.
+- **`persistence` is scored but not eligible** unless `--allow-baseline` is passed: a constant has no SHAP attribution, and the dashboard's explanation panel is a deliverable.
+- **Every candidate's metrics are stored with the version** (`selection.comparison` on the registry document), so the comparison behind a served model survives the run that produced it. `python -m app.src.registry.cli show <name>` prints it; the daily workflow renders it into the job summary via `app/src/training/report.py`.
+- **Explanations follow the winner.** `explainer.py` picks its method from what the fitted estimator exposes — exact linear contributions for `coef_` models, `shap.TreeExplainer` for trees, XGBoost's own TreeSHAP as a fallback — so switching family keeps the SHAP panel working. For every method, `base_value + sum(contributions)` reconstructs the prediction exactly.
+
+Result on the 2025-08 → 2026-08 Karachi data (7,749 usable rows), against the XGBoost-only pipeline it replaces:
+
+| Horizon | Was (XGBoost) | Now | Winner | Test MAE | Test R² | Skill vs persistence |
+|---|---|---|---|---|---|---|
+| Day 1 | MAE 3.76, R² 0.861, skill **−0.025** | MAE 3.71, R² 0.866, skill **+0.007** | `random_forest` | 3.71 | +0.866 | +0.007 |
+| Day 2 | MAE 7.08, R² 0.568, skill +0.024 | MAE 6.95, R² 0.580, skill +0.052 | `random_forest` | 6.95 | +0.580 | +0.052 |
+| Day 3 | MAE 9.32, R² 0.275, skill +0.027 | MAE 9.06, R² 0.315, skill +0.081 | `hist_gbm` | 9.06 | +0.315 | +0.081 |
+
+Day 1's skill against persistence crossed from negative to positive — the previous model was very slightly worse than simply carrying the current reading forward. Day 1 remains close to persistence (3.71 vs 3.71 MAE); the honest reading is that the model adds little at 24 hours and most of its value is at 48–72 hours.
+
+The registry slot names (`aqi_xgboost_day1`, …) are deliberately unchanged: version numbers, promotion history and rollback are keyed on them, so renaming per family would restart numbering and leave the promotion gate with no incumbent. The `candidate`, `model_family` and `model_type` fields on each document say what is actually inside.
 - Guardrails: refuses to train on fewer than `--min-rows` usable rows (default 500), and scores every horizon against a **persistence baseline** (assume the next three days look like now) so a horizon that adds no value is visible in the metrics.
 - Alongside the `.pkl` files it writes `app/models/training_metadata.json` — trained-at timestamp, city, hyperparameters, row counts, data range, missing hourly rows, and MAE / RMSE / R² (plus baseline R²) per horizon.
 - `.github/workflows/daily_training.yml` — runs daily at 02:30 UTC (07:30 PKT) or on demand via *Run workflow*: retrain → publish each horizon to the model registry → smoke-test whatever is now in `production` through the real serving path → print the registry table to the run summary. Nothing is committed back to the repo, so the workflow only needs `contents: read`.
@@ -166,7 +198,7 @@ Two things worth saying plainly, since the skill column sits close to zero:
 - [ ] Move feature engineering into a reusable module shared by training and inference (currently only exists inline in the notebooks — training/serving will skew until this lands).
 
 ### 🔜 Phase 3 — Model training
-- [x] ~~Train and compare multiple regressors~~ — Linear Regression, Ridge, Random Forest, XGBoost and LightGBM trained and compared in `lag_feature_engineering.ipynb`.
+- [x] ~~Train and compare multiple regressors~~ — done twice over: a one-off five-model comparison in `lag_feature_engineering.ipynb`, and now a candidate slate (persistence / Ridge / Random Forest / HistGradientBoosting / XGBoost) evaluated per horizon on **every** retrain, with the winner chosen on a validation block and the full comparison stored on the registry document.
 - [x] ~~Time-based train/test split~~ — 80/20 chronological split (no shuffling); no time-series cross-validation yet.
 - [x] ~~Evaluate with R², RMSE, MAE~~ — best is XGBoost (MAE 8.88, RMSE 11.85, R² 0.46).
 - [x] ~~Persist the trained model~~ — saved as `.pkl` files via `joblib` to `app/models/` (git-ignored, not yet uploaded anywhere durable).
@@ -230,7 +262,10 @@ Air-Quality-Index-Predictor/
 │       │   ├── build_prediction_features.py   # Latest feature row for serving
 │       │   └── predictor.py                   # Loads the .pkl models, returns the 3-day forecast
 │       ├── training/
-│       │   └── train.py              # Daily retraining pipeline (CLI)
+│       │   ├── train.py              # Daily retraining pipeline (CLI)
+│       │   ├── candidates.py         # Candidate model slate (persistence/ridge/RF/HistGBM/XGBoost)
+│       │   ├── selection.py          # Per-horizon evaluation + winner selection
+│       │   └── report.py             # Run metadata -> Markdown (CI job summary)
 │       ├── registry/
 │       │   ├── model_registry.py     # MongoDB/GridFS model registry
 │       │   └── cli.py                # Registry CLI (list/show/promote/rollback/prune)
@@ -309,7 +344,8 @@ python -m app.src.features.pipeline --city karachi
 # Backfill the last 365 days of history for a city (pollutants + weather)
 python -m app.src.features.backfill --city karachi --days 365
 
-# Retrain the 3-day forecast models (what the daily workflow runs)
+# Retrain the 3-day forecast models (what the daily workflow runs).
+# Trains the full candidate slate per horizon and publishes the winners.
 python -m app.src.training.train --city karachi
 
 # Train and report metrics without publishing or overwriting anything
@@ -317,6 +353,16 @@ python -m app.src.training.train --city karachi --no-publish --no-save
 
 # Register the new versions but leave promotion to a human
 python -m app.src.training.train --city karachi --promotion never
+
+# Model selection controls
+python -m app.src.training.train --candidates xgboost                 # skip the bake-off
+python -m app.src.training.train --candidates all --allow-baseline    # let persistence compete
+python -m app.src.training.train --select-metric rmse --select-margin 0.05
+python -m app.src.training.train --default-model random_forest        # change the incumbent
+
+# Render a run's candidate comparison as Markdown (what CI puts in the job summary)
+python -m app.src.training.train --city karachi --no-publish --metadata-out run.json
+python -m app.src.training.report run.json
 
 # Inspect the model registry
 python -m app.src.registry.cli list
@@ -389,7 +435,8 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Exploratory data analysis | ✅ Done |
 | Lag / rolling feature engineering | ✅ Done (notebook-only) |
 | Model training & comparison (24h-ahead, 5 models) | ✅ Done |
-| Day-wise 3-day forecasting (per-horizon XGBoost) | ✅ Done |
+| Automated model selection per retrain (5-candidate slate, validation-ranked) | ✅ Done — Day 1 skill vs persistence −0.025 → +0.007, Day 3 R² 0.275 → 0.315 |
+| Day-wise 3-day forecasting (per-horizon model, selected per retrain) | ✅ Done |
 | Day-3 accuracy rework (negative R² fixed) | ✅ Done — Day 3 R² -0.03 → +0.26, all horizons positive |
 | Data quality fixes (AQI definition, dedup, etc.) | 🔜 Pending |
 | Feature engineering module shared by train/serve | 🔜 Pending |

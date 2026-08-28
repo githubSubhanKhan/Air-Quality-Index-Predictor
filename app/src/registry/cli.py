@@ -19,7 +19,7 @@ import joblib
 from app.src.registry import model_registry as registry
 
 HEADER = (
-    f"{'NAME':<22}{'VER':>4}  {'STAGE':<11}"
+    f"{'NAME':<22}{'VER':>4}  {'STAGE':<11}{'MODEL':<15}"
     f"{'MAE':>8}{'RMSE':>8}{'R2':>9}{'BASE R2':>9}"
     f"{'ROWS':>8}  {'TRAINED AT':<22}ARTIFACT"
 )
@@ -34,10 +34,15 @@ def _row(document: dict) -> str:
 
         return f"{value:>{width}.{digits}f}"
 
+    # Versions registered before candidate selection have no `candidate`
+    # field; fall back to the estimator class so old rows still line up.
+    model = document.get("candidate") or document.get("model_type") or "-"
+
     return (
         f"{document['name']:<22}"
         f"{document['version']:>4}  "
         f"{document['stage']:<11}"
+        f"{model[:14]:<15}"
         f"{number(metrics.get('mae'), 8)}"
         f"{number(metrics.get('rmse'), 8)}"
         f"{number(metrics.get('r2'), 9, 4)}"
@@ -71,7 +76,7 @@ def cmd_show(args) -> None:
     else:
         document = registry.get_version(args.name, args.version)
 
-    print(json.dumps(registry.summarise(document), indent=2))
+    print(json.dumps(registry.summarise(document, full=True), indent=2))
 
 
 def cmd_promote(args) -> None:
