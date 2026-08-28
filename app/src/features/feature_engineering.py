@@ -15,6 +15,15 @@ Two things matter here beyond building columns:
    the trees saw in training, so the model set is built from *relative*
    features — deviations from trailing means — which stay in range.
 
+3. **The raw history block.** The classical forecasters in
+   ``app/src/training/statistical.py`` model the AQI *series*, not a
+   feature-to-target mapping, so they need the recent hourly readings
+   themselves rather than summaries of them. ``create_history_features``
+   attaches them as ``aqi_hist_0`` (now) through ``aqi_hist_167`` (a week
+   ago), which lets a series model be an ordinary estimator with its own
+   feature list — the registry already stores one per horizon, so nothing in
+   serving had to learn about a new kind of model.
+
 Legacy columns (``day``, ``month``, raw pollutant levels, the original lag
 and rolling set) are still produced, because model versions registered before
 this change reference them and must keep serving after a rollback.
@@ -30,6 +39,31 @@ WEATHER = ["temperature", "humidity", "pressure", "wind_speed"]
 # Gaps up to this many hours are carried forward. Forward only — a later
 # reading must never fill an earlier hour, or features would see the future.
 FFILL_LIMIT = 6
+
+# Hours of raw hourly AQI handed to the series models. One week: seven daily
+# cycles is enough to estimate a 24-hour seasonal profile and a local trend,
+# and it is short enough that the block adds no NaN rows the curated feature
+# set did not already have (``aqi_roll_mean_168`` needs a comparable run-up),
+# so the usable-row count — and therefore every model's metrics — is
+# unaffected by turning it on.
+HISTORY_WINDOW = 168
+
+HISTORY_PREFIX = "aqi_hist_"
+
+
+def history_columns(window: int = HISTORY_WINDOW) -> list:
+    """
+    The history block's column names, newest first.
+
+    ``aqi_hist_0`` is the reading at the row's own timestamp, so a row's
+    window in chronological order is this list reversed.
+    """
+
+    return [f"{HISTORY_PREFIX}{lag}" for lag in range(window)]
+
+
+def is_history_column(name: str) -> bool:
+    return str(name).startswith(HISTORY_PREFIX)
 
 
 def _rolling(series: pd.Series, window: int, how: str = "mean") -> pd.Series:
@@ -145,12 +179,38 @@ def create_stationary_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_training_features(df: pd.DataFrame) -> pd.DataFrame:
+def create_history_features(
+    df: pd.DataFrame,
+    window: int = HISTORY_WINDOW,
+) -> pd.DataFrame:
+    """
+    The last ``window`` hours of AQI, one column per hour of lag.
+
+    Built in one ``concat`` rather than ``window`` separate assignments, which
+    would fragment the frame and warn about it. Gaps are left as NaN on
+    purpose: how to bridge a missing hour is a modelling choice, so the
+    forecaster makes it (see ``statistical._clean_window``) rather than having
+    it silently baked into the feature.
+    """
+
+    shifted = [
+        df["aqi"].shift(lag).rename(f"{HISTORY_PREFIX}{lag}")
+        for lag in range(window)
+    ]
+
+    return pd.concat([df, *shifted], axis=1)
+
+
+def build_training_features(
+    df: pd.DataFrame,
+    include_history: bool = True,
+) -> pd.DataFrame:
     """
     The full feature frame, used by both training and serving.
 
     Returns a frame with ``timestamp`` back as a column, matching what the
-    rest of the project expects.
+    rest of the project expects. ``include_history=False`` skips the raw
+    history block, for callers that only want the curated feature set.
     """
 
     df = normalise_hourly(df)
@@ -159,5 +219,8 @@ def build_training_features(df: pd.DataFrame) -> pd.DataFrame:
     df = create_lag_features(df)
     df = create_rolling_features(df)
     df = create_stationary_features(df)
+
+    if include_history:
+        df = create_history_features(df)
 
     return df.reset_index(names="timestamp")

@@ -22,7 +22,9 @@ they go unsaid:
 The correction weight makes the comparison fair in a way that scoring raw
 model output would not. Each candidate gets its own ``alpha``, fitted on
 validation, so a family whose predictions are mostly noise is damped towards
-persistence automatically rather than being punished for its variance.
+persistence automatically rather than being punished for its variance. It also
+puts the feature-based and series-based models on the same footing: both are
+scored on the reconstructed AQI forecast, not on their own internal quantity.
 """
 
 import time
@@ -99,7 +101,9 @@ class Trial:
     alpha_unshrunk: float
     validation: dict
     test: dict
+    feature_count: int = 0
     fit_seconds: float = 0.0
+    predict_seconds: float = 0.0
     selected: bool = False
     notes: str = ""
 
@@ -120,11 +124,21 @@ class Trial:
             "label": self.candidate.label,
             "family": self.candidate.family,
             "model_type": self.model_type,
+            "feature_set": self.candidate.feature_set,
+            "feature_count": self.feature_count,
             "params": dict(self.candidate.params),
-            "reference_only": self.candidate.is_baseline,
+            # What estimation actually produced, where the candidate fits
+            # parameters of its own (smoothing constants, AR order and
+            # coefficients). Empty for the ML models, whose fitted state is
+            # the artifact itself.
+            "fitted_params": getattr(self.model, "fitted_params_", {}) or {},
+            "selectable": self.candidate.selectable,
+            "reference_only": not self.candidate.selectable,
+            "reference_note": self.candidate.reference_note,
             "alpha": self.alpha,
             "alpha_unshrunk": self.alpha_unshrunk,
             "fit_seconds": round(self.fit_seconds, 2),
+            "predict_seconds": round(self.predict_seconds, 2),
             "validation": self.validation,
             "test": self.test,
             "selected": self.selected,
@@ -133,24 +147,29 @@ class Trial:
 
 def evaluate_candidate(
     candidate: zoo.Candidate,
-    X,
+    frames: dict,
     y_absolute,
     anchor,
     fit_end: int,
     validation: slice,
     test: slice,
     shrinkage: float,
+    horizon_hours: int,
 ) -> Trial:
     """
     Fit one candidate, fit its alpha on validation, score both blocks.
 
-    ``y_absolute`` is the AQI level the horizon targets; the candidate is
-    fitted on the deviation of that level from ``anchor``.
+    ``frames`` maps a feature-set name to the frame of those columns, so a
+    series model can read raw hourly history while the feature-based models
+    read the curated list. ``y_absolute`` is the AQI level the horizon
+    targets; the candidate is fitted on its deviation from ``anchor``.
     """
+
+    X = frames[candidate.feature_set]
 
     y_delta = y_absolute - anchor
 
-    model = candidate.build()
+    model = candidate.build(horizon_hours)
 
     started = time.perf_counter()
 
@@ -158,7 +177,13 @@ def evaluate_candidate(
 
     fit_seconds = time.perf_counter() - started
 
-    validation_delta = model.predict(X.iloc[validation])
+    started = time.perf_counter()
+
+    validation_delta = np.asarray(model.predict(X.iloc[validation]), dtype=float)
+
+    test_delta = np.asarray(model.predict(X.iloc[test]), dtype=float)
+
+    predict_seconds = time.perf_counter() - started
 
     unshrunk = fit_alpha(
         y_absolute.iloc[validation],
@@ -176,7 +201,7 @@ def evaluate_candidate(
 
     test_metrics = score(
         y_absolute.iloc[test],
-        anchor.iloc[test].to_numpy() + alpha * model.predict(X.iloc[test]),
+        anchor.iloc[test].to_numpy() + alpha * test_delta,
         anchor.iloc[test],
     )
 
@@ -187,26 +212,29 @@ def evaluate_candidate(
         alpha_unshrunk=round(unshrunk, 4),
         validation=validation_metrics,
         test=test_metrics,
+        feature_count=X.shape[1],
         fit_seconds=fit_seconds,
+        predict_seconds=predict_seconds,
     )
 
 
 def evaluate_slate(
     slate,
-    X,
+    frames: dict,
     y_absolute,
     anchor,
     fit_end: int,
     validation: slice,
     test: slice,
     shrinkage: float,
+    horizon_hours: int,
 ) -> list:
     """
     Every candidate on the slate, fitted and scored.
 
     A candidate that fails to fit is skipped with a warning rather than
-    failing the retrain — one broken family should not stop the other four
-    from producing a servable model.
+    failing the retrain — one broken family should not stop the others from
+    producing a servable model.
     """
 
     trials = []
@@ -215,13 +243,14 @@ def evaluate_slate(
         try:
             trials.append(evaluate_candidate(
                 candidate,
-                X,
+                frames,
                 y_absolute,
                 anchor,
                 fit_end,
                 validation,
                 test,
                 shrinkage,
+                horizon_hours,
             ))
 
         except Exception as exc:
@@ -250,24 +279,35 @@ def _relative_gain(challenger: float, incumbent: float, lower_is_better: bool) -
     return difference / abs(incumbent)
 
 
+def _rank(trials: list, metric: str) -> list:
+    lower_is_better = metric in LOWER_IS_BETTER
+
+    return sorted(
+        trials,
+        key=lambda trial: trial.value(metric),
+        reverse=not lower_is_better,
+    )
+
+
 def select(
     trials: list,
     metric: str = DEFAULT_SELECTION_METRIC,
     margin: float = DEFAULT_SELECTION_MARGIN,
     default_model: str = zoo.DEFAULT_MODEL,
-    allow_baseline: bool = False,
+    allow_reference: bool = False,
 ) -> tuple:
     """
     Pick the winning trial. Returns ``(trial, reason)``.
 
-    Reference candidates such as ``persistence`` are scored but not eligible
-    unless ``allow_baseline`` is set — a constant has no SHAP explanation, and
-    the dashboard's explanation panel is part of what ships.
+    Reference and series candidates are scored but not eligible unless
+    ``allow_reference`` is set — neither offers per-feature attribution, and
+    the dashboard's explanation panel is part of what ships. Use
+    ``reference_advisory`` to find out whether excluding them cost anything.
     """
 
     eligible = [
         trial for trial in trials
-        if allow_baseline or not trial.candidate.is_baseline
+        if allow_reference or trial.candidate.selectable
     ]
 
     note = ""
@@ -275,17 +315,11 @@ def select(
     if not eligible:
         eligible = list(trials)
 
-        note = " (only reference candidates were on the slate)"
+        note = " (no selectable candidate was on the slate)"
 
     lower_is_better = metric in LOWER_IS_BETTER
 
-    ranked = sorted(
-        eligible,
-        key=lambda trial: trial.value(metric),
-        reverse=not lower_is_better,
-    )
-
-    best = ranked[0]
+    best = _rank(eligible, metric)[0]
 
     incumbent = next(
         (
@@ -331,10 +365,47 @@ def select(
     )
 
 
+def reference_advisory(
+    trials: list,
+    winner: Trial,
+    metric: str = DEFAULT_SELECTION_METRIC,
+) -> str:
+    """
+    Say so when a non-selectable candidate would have won the slot.
+
+    Excluding the reference and series models by default is a deliberate
+    trade — explanations over a small accuracy gain — but it is only an
+    honest one if the run says out loud when the trade cost something.
+    Returns "" when it did not.
+    """
+
+    overall = _rank(trials, metric)[0]
+
+    if overall is winner or overall.candidate.selectable:
+        return ""
+
+    gain = _relative_gain(
+        overall.value(metric),
+        winner.value(metric),
+        metric in LOWER_IS_BETTER,
+    )
+
+    if gain <= 0:
+        return ""
+
+    return (
+        f"{overall.candidate.name} had the best validation {metric} "
+        f"({overall.value(metric):.4f} vs {winner.value(metric):.4f}, "
+        f"{gain:.1%} better) but is reference-only "
+        f"({overall.candidate.reference_note}). "
+        f"Pass --allow-reference to let it take the slot."
+    )
+
+
 HEADER = (
-    f"        {'':2}{'CANDIDATE':<22}{'FAMILY':<10}{'ALPHA':>6}"
-    f"{'VAL MAE':>10}{'VAL RMSE':>10}{'VAL R2':>9}"
-    f"{'TEST MAE':>10}{'TEST RMSE':>10}{'TEST R2':>9}{'SKILL':>8}"
+    f"        {'':2}{'CANDIDATE':<16}{'FAMILY':<12}{'FEAT':>5}{'ALPHA':>7}"
+    f"{'VAL MAE':>9}{'VAL RMSE':>10}{'VAL R2':>9}"
+    f"{'TEST MAE':>10}{'TEST RMSE':>10}{'TEST R2':>9}{'SKILL':>8}{'SEC':>7}"
 )
 
 
@@ -342,39 +413,33 @@ def comparison_table(trials: list, metric: str = DEFAULT_SELECTION_METRIC) -> st
     """
     The slate as a fixed-width table, ranked by the selection metric.
 
-    Winner marked ``*``, reference-only candidates marked ``~``.
+    Winner marked ``*``, candidates that were scored but not eligible ``~``.
     """
-
-    lower_is_better = metric in LOWER_IS_BETTER
-
-    ranked = sorted(
-        trials,
-        key=lambda trial: trial.value(metric),
-        reverse=not lower_is_better,
-    )
 
     lines = [HEADER]
 
-    for trial in ranked:
+    for trial in _rank(trials, metric):
         if trial.selected:
             mark = "*"
-        elif trial.candidate.is_baseline:
+        elif not trial.candidate.selectable:
             mark = "~"
         else:
             mark = " "
 
         lines.append(
             f"        {mark:<2}"
-            f"{trial.candidate.name:<22}"
-            f"{trial.candidate.family:<10}"
-            f"{trial.alpha:>6.2f}"
-            f"{trial.validation['mae']:>10.3f}"
+            f"{trial.candidate.name:<16}"
+            f"{trial.candidate.family:<12}"
+            f"{trial.feature_count:>5}"
+            f"{trial.alpha:>7.2f}"
+            f"{trial.validation['mae']:>9.3f}"
             f"{trial.validation['rmse']:>10.3f}"
             f"{trial.validation['r2']:>9.4f}"
             f"{trial.test['mae']:>10.3f}"
             f"{trial.test['rmse']:>10.3f}"
             f"{trial.test['r2']:>9.4f}"
             f"{trial.test['skill_vs_persistence']:>8.3f}"
+            f"{trial.fit_seconds + trial.predict_seconds:>7.1f}"
         )
 
     return "\n".join(lines)

@@ -92,20 +92,24 @@ The system collects live and historical air quality data, engineers features int
 ### ✅ Automated model selection per retrain
 Previously the pipeline trained one XGBoost per horizon and took the five-model comparison in `lag_feature_engineering.ipynb` as justification — but that comparison was run once, against a different target (24h-ahead *absolute* AQI on 26 features), and nothing re-checked it after the horizons moved to a damped correction on 14 features.
 
-Every retrain now trains a **candidate slate** per horizon and keeps the winner:
+Every retrain now trains a **candidate slate** per horizon and keeps the winner. The slate deliberately spans the range the brief asks for — "from statistical modelling to deep learning":
 
-| Candidate | Family | Estimator |
-|---|---|---|
-| `persistence` | constant | `DummyRegressor` — the null model, reference only |
-| `ridge` | linear | `StandardScaler` + `Ridge` |
-| `random_forest` | tree | `RandomForestRegressor` |
-| `hist_gbm` | tree | `HistGradientBoostingRegressor` |
-| `xgboost` | tree | `XGBRegressor` — the incumbent |
+| Candidate | Family | Estimator | Inputs |
+|---|---|---|---|
+| `persistence` | constant | `DummyRegressor` — the null model | curated (14) |
+| `seasonal_naive` | seasonal | this hour tomorrow = this hour today | history (168) |
+| `holt_winters` | statistical | additive Holt-Winters ETS, damped trend + 24h seasonality | history (168) |
+| `seasonal_ar` | statistical | SARIMA(p,0,0)(0,1,0)[24] — seasonal difference + AR(p) | history (168) |
+| `ridge` | linear | `StandardScaler` + `Ridge` | curated (14) |
+| `random_forest` | tree | `RandomForestRegressor` | curated (14) |
+| `hist_gbm` | tree | `HistGradientBoostingRegressor` | curated (14) |
+| `xgboost` | tree | `XGBRegressor` — the incumbent | curated (14) |
 
-- **Defined in** `app/src/training/candidates.py`; evaluation and the selection rule in `app/src/training/selection.py`.
+- **Defined in** `app/src/training/candidates.py`; the classical forecasters in `app/src/training/statistical.py`; evaluation and the selection rule in `app/src/training/selection.py`.
+- **Everything is compared like for like.** Every candidate predicts the same quantity — the deviation of the horizon's mean AQI from the current reading — and is scored on the reconstructed AQI forecast, not on its own internal output. The series models forecast an hourly path, average the relevant 24-hour slice, and subtract the last observation.
 - **Selection is on the validation block only.** Train fits, validation fits each candidate's `alpha` *and* ranks the candidates, test is scored once and never consulted before the choice. Test metrics are recorded for every candidate for the write-up, but took no part in the decision — on day 3, `random_forest` in fact edges `hist_gbm` on test while losing on validation, which is exactly the honesty this protocol buys.
 - **A 2% margin guards the incumbent.** A challenger must beat `xgboost` by 2% on validation MAE to take the slot, so the served family does not flip between daily retrains on differences inside the noise.
-- **`persistence` is scored but not eligible** unless `--allow-baseline` is passed: a constant has no SHAP attribution, and the dashboard's explanation panel is a deliverable.
+- **The reference and series models are scored but not eligible** unless `--allow-reference` is passed: none of them offers per-feature attribution, and the dashboard's SHAP panel is a deliverable. Every run reports when excluding them cost accuracy, so the trade is visible rather than silent.
 - **Every candidate's metrics are stored with the version** (`selection.comparison` on the registry document), so the comparison behind a served model survives the run that produced it. `python -m app.src.registry.cli show <name>` prints it; the daily workflow renders it into the job summary via `app/src/training/report.py`.
 - **Explanations follow the winner.** `explainer.py` picks its method from what the fitted estimator exposes — exact linear contributions for `coef_` models, `shap.TreeExplainer` for trees, XGBoost's own TreeSHAP as a fallback — so switching family keeps the SHAP panel working. For every method, `base_value + sum(contributions)` reconstructs the prediction exactly.
 
@@ -118,6 +122,36 @@ Result on the 2025-08 → 2026-08 Karachi data (7,749 usable rows), against the 
 | Day 3 | MAE 9.32, R² 0.275, skill +0.027 | MAE 9.06, R² 0.315, skill +0.081 | `hist_gbm` | 9.06 | +0.315 | +0.081 |
 
 Day 1's skill against persistence crossed from negative to positive — the previous model was very slightly worse than simply carrying the current reading forward. Day 1 remains close to persistence (3.71 vs 3.71 MAE); the honest reading is that the model adds little at 24 hours and most of its value is at 48–72 hours.
+
+### ✅ Statistical forecasting models
+`app/src/training/statistical.py` adds the classical end of the range as three real candidates, not a notebook aside — they are fitted, backtested and compared on every retrain, and any of them can hold a production slot.
+
+**Why they needed a different input.** A series model describes the AQI series itself rather than a feature-to-target mapping, so the 14 curated features are the wrong input. `feature_engineering.create_history_features` attaches the raw hourly readings as `aqi_hist_0` (now) through `aqi_hist_167` (a week ago), and each forecaster reads its window from there. The registry already stored a **feature list per horizon**, so a series model registers, promotes, rolls back and serves through exactly the same code as the trees — verified end to end, with `seasonal_ar` holding all three slots.
+
+**Fitted once, state rebuilt per row.** Refitting a seasonal model for each of the ~2,600 evaluation rows, three times over, would take hours. Parameters are estimated once on ~33 week-long segments of the training block; each prediction re-runs the recursion over that row's own week to get the state it forecasts from. Training and serving therefore share one code path — deriving state from the whole series during evaluation and from a window in production would be a skew that only appeared once deployed.
+
+**What estimation actually found on the Karachi data:**
+
+| Model | Fitted | Reading |
+|---|---|---|
+| `holt_winters` | α 0.99, β 0.0001, γ 0.28, φ 0.80 | Level tracks the latest reading, no trend, moderate daily seasonality, maximum damping — i.e. the series is close to a seasonal random walk |
+| `seasonal_ar` | order 24 by AIC, largest root 0.998, stationary | A full day of autoregressive structure survives the seasonal difference |
+
+Order selection **rejects non-stationary fits**: least squares will happily return coefficients whose characteristic roots sit on the unit circle, and running that recursion 72 steps forward diverges exponentially. The chosen AR(24) has a largest root of 0.998 — stationary, but close enough to the boundary that leaving the check out would be relying on luck as the store grows.
+
+**Result: the classical models are genuinely competitive at 24 hours.** On the day-1 test block, `seasonal_ar` has the best MAE and skill of the entire eight-candidate slate:
+
+| Candidate | Day-1 val MAE (ranked on) | Day-1 test MAE | Test R² | Skill |
+|---|---|---|---|---|
+| `random_forest` **(selected)** | **6.76** | 3.71 | +0.866 | +0.007 |
+| `seasonal_ar` | 7.10 | **3.59** | **+0.872** | **+0.052** |
+| `holt_winters` | 7.28 | 3.68 | +0.867 | +0.019 |
+| `xgboost` | 7.13 | 3.76 | +0.861 | −0.025 |
+| `persistence` | 7.27 | 3.71 | +0.865 | 0.000 |
+
+`seasonal_ar` ranked second on validation, so it was not selected — selecting on the test column is exactly the peeking the protocol exists to prevent. But the gap is small enough to be worth saying plainly: at 24 hours the tree ensembles have no real edge over a seasonal AR, and five of the eight candidates land within 0.26 MAE of each other. Adding the four non-ML candidates costs about 4 seconds; a full retrain is ~35 seconds.
+
+**Still missing from the brief's range:** deep learning (TensorFlow/PyTorch). That is the one remaining model-variety gap.
 
 The registry slot names (`aqi_xgboost_day1`, …) are deliberately unchanged: version numbers, promotion history and rollback are keyed on them, so renaming per family would restart numbering and leave the promotion gate with no incumbent. The `candidate`, `model_family` and `model_type` fields on each document say what is actually inside.
 - Guardrails: refuses to train on fewer than `--min-rows` usable rows (default 500), and scores every horizon against a **persistence baseline** (assume the next three days look like now) so a horizon that adds no value is visible in the metrics.
@@ -263,7 +297,8 @@ Air-Quality-Index-Predictor/
 │       │   └── predictor.py                   # Loads the .pkl models, returns the 3-day forecast
 │       ├── training/
 │       │   ├── train.py              # Daily retraining pipeline (CLI)
-│       │   ├── candidates.py         # Candidate model slate (persistence/ridge/RF/HistGBM/XGBoost)
+│       │   ├── candidates.py         # Candidate model slate (reference / statistical / ML)
+│       │   ├── statistical.py        # Seasonal naive, Holt-Winters ETS, seasonal AR (SARIMA)
 │       │   ├── selection.py          # Per-horizon evaluation + winner selection
 │       │   └── report.py             # Run metadata -> Markdown (CI job summary)
 │       ├── registry/
@@ -356,7 +391,8 @@ python -m app.src.training.train --city karachi --promotion never
 
 # Model selection controls
 python -m app.src.training.train --candidates xgboost                 # skip the bake-off
-python -m app.src.training.train --candidates all --allow-baseline    # let persistence compete
+python -m app.src.training.train --candidates all --allow-reference   # let the series models compete
+python -m app.src.training.train --candidates seasonal_ar,holt_winters,seasonal_naive --allow-reference
 python -m app.src.training.train --select-metric rmse --select-margin 0.05
 python -m app.src.training.train --default-model random_forest        # change the incumbent
 
@@ -419,6 +455,7 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | `pm25_lag_1/6/24` | PM2.5 value 1/6/24 hours ago |
 | `aqi_roll_mean_6/12/24` | Rolling mean AQI over the trailing 6/12/24 hours |
 | `aqi_roll_std_24` | Rolling std of AQI over the trailing 24 hours |
+| `aqi_hist_0…167` | The **history block**: raw hourly AQI from now back one week, read only by the statistical forecasters. Deliberately excluded from the completeness check on both sides — in training so the usable-row count (and therefore every model's metrics) is unchanged by it, and in serving so a gap longer than the 6-hour ffill limit cannot discard the newest row and quietly stale the forecast |
 | `target_day1/2/3` | **3-day forecast targets** — mean AQI over hours 1–24 / 25–48 / 49–72 ahead |
 
 ---
@@ -435,7 +472,9 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Exploratory data analysis | ✅ Done |
 | Lag / rolling feature engineering | ✅ Done (notebook-only) |
 | Model training & comparison (24h-ahead, 5 models) | ✅ Done |
-| Automated model selection per retrain (5-candidate slate, validation-ranked) | ✅ Done — Day 1 skill vs persistence −0.025 → +0.007, Day 3 R² 0.275 → 0.315 |
+| Automated model selection per retrain (8-candidate slate, validation-ranked) | ✅ Done — Day 1 skill vs persistence −0.025 → +0.007, Day 3 R² 0.275 → 0.315 |
+| Statistical forecasting models (seasonal naive, Holt-Winters ETS, seasonal AR) | ✅ Done — fitted, backtested and servable; `seasonal_ar` has the best Day-1 test MAE on the slate |
+| Deep learning models (TensorFlow / PyTorch) | 🔜 Pending |
 | Day-wise 3-day forecasting (per-horizon model, selected per retrain) | ✅ Done |
 | Day-3 accuracy rework (negative R² fixed) | ✅ Done — Day 3 R² -0.03 → +0.26, all horizons positive |
 | Data quality fixes (AQI definition, dedup, etc.) | 🔜 Pending |

@@ -16,12 +16,19 @@ absolute-target setup lacked:
   across a year to put the far horizons outside the training range.
 
 **Which** model provides that correction is decided per retrain, not assumed.
-Every horizon trains the candidate slate in ``candidates.py`` — persistence,
-Ridge, Random Forest, HistGradientBoosting, XGBoost — and keeps whichever wins
-on the validation window, subject to a margin that stops the served family
-flip-flopping on noise. All five candidates' metrics are recorded with the
-version, so the comparison behind the choice is auditable after the fact
+Every horizon trains the candidate slate in ``candidates.py`` and keeps
+whichever wins on the validation window, subject to a margin that stops the
+served family flip-flopping on noise. The slate spans the range the brief asks
+for — two reference benchmarks, two classical statistical models (Holt-Winters
+ETS and a seasonal autoregressive model, in ``statistical.py``) and four
+machine-learning regressors — and every candidate's metrics are recorded with
+the version, so the comparison behind the choice is auditable after the fact
 rather than living in a notebook that was run once.
+
+The statistical candidates read the raw hourly history block rather than the
+curated feature list. That is why a horizon's feature list travels with its
+registry document: the two kinds of model coexist without serving needing to
+know which it is holding.
 
 Evaluation is chronological and **purged**: a training row's target window
 reaches 72 hours ahead, so the 72 rows before each boundary are dropped.
@@ -36,7 +43,7 @@ Usage:
     python -m app.src.training.train --city karachi
     python -m app.src.training.train --city karachi --no-publish --no-save
     python -m app.src.training.train --candidates xgboost --no-publish
-    python -m app.src.training.train --candidates all --allow-baseline
+    python -m app.src.training.train --candidates all --allow-reference
 """
 
 import argparse
@@ -52,7 +59,10 @@ import xgboost
 from dotenv import load_dotenv
 
 from app.src.explain.explainer import global_importance
-from app.src.features.feature_engineering import build_training_features
+from app.src.features.feature_engineering import (
+    build_training_features,
+    history_columns,
+)
 from app.src.features.feature_store import get_collection
 from app.src.registry import model_registry as registry
 from app.src.training import candidates as zoo
@@ -93,6 +103,23 @@ FEATURE_COLUMNS = [
     "humidity",
     "wind_speed",
 ]
+
+
+def feature_columns_for(feature_set: str) -> list:
+    """
+    The columns a candidate's feature set names.
+
+    The ML candidates take the curated list above. The statistical candidates
+    take the raw hourly history block instead, because they model the series
+    rather than a feature-to-target mapping. Each horizon records the list its
+    winner actually used, and the registry stores it per version, which is
+    what lets the two kinds coexist without serving knowing the difference.
+    """
+
+    if feature_set == zoo.FEATURE_SET_HISTORY:
+        return history_columns()
+
+    return list(FEATURE_COLUMNS)
 
 # Forecast horizon -> hours ahead the target window ends at.
 # day1 = mean AQI over hours 1-24, day2 = 25-48, day3 = 49-72.
@@ -226,7 +253,7 @@ def run(
     select_metric: str = selection.DEFAULT_SELECTION_METRIC,
     select_margin: float = selection.DEFAULT_SELECTION_MARGIN,
     default_model: str = zoo.DEFAULT_MODEL,
-    allow_baseline: bool = False,
+    allow_reference: bool = False,
 ) -> dict:
     """
     Retrain every forecast horizon and return the run's metadata.
@@ -273,7 +300,17 @@ def run(
 
     test = slice(validation_end, total)
 
-    X = df[FEATURE_COLUMNS]
+    # One frame per feature set the slate needs. The history block keeps its
+    # NaNs — only the first week of the store has any, and the series models
+    # deal with missing hours themselves — so it is deliberately not part of
+    # the dropna above: adding it there would shrink the usable rows and make
+    # every model's metrics incomparable with previous runs.
+    feature_sets = {
+        name: feature_columns_for(name)
+        for name in zoo.feature_sets_used(candidate_slate)
+    }
+
+    frames = {name: df[columns] for name, columns in feature_sets.items()}
 
     anchor = df[ANCHOR_COLUMN]
 
@@ -286,9 +323,15 @@ def run(
         f"   (purge {PURGE_ROWS} rows per boundary)\n"
         f"Missing hours : {missing_hours}\n"
         f"Candidates    : {', '.join(c.name for c in candidate_slate)}\n"
+        f"Feature sets  : "
+        + ", ".join(
+            f"{name} ({len(columns)} columns)"
+            for name, columns in feature_sets.items()
+        )
+        + "\n"
         f"Selection     : validation {select_metric}, "
         f"{select_margin:.1%} margin over '{default_model}'"
-        f"{'' if allow_baseline else ', reference models excluded'}\n"
+        f"{'' if allow_reference else ', reference models excluded'}\n"
     )
 
     models = {}
@@ -298,20 +341,21 @@ def run(
     chosen = {}
     comparisons = {}
 
-    for horizon in HORIZONS:
+    for horizon, horizon_hours in HORIZONS.items():
         print(f"{horizon}")
 
         y_absolute = df[target_column(horizon)]
 
         trials = selection.evaluate_slate(
             candidate_slate,
-            X,
+            frames,
             y_absolute,
             anchor,
             fit_end,
             validation,
             test,
             shrinkage,
+            horizon_hours,
         )
 
         winner, reason = selection.select(
@@ -319,7 +363,7 @@ def run(
             metric=select_metric,
             margin=select_margin,
             default_model=default_model,
-            allow_baseline=allow_baseline,
+            allow_reference=allow_reference,
         )
 
         winner.selected = True
@@ -328,7 +372,18 @@ def run(
 
         print(f"        selected {winner.candidate.name}: {reason}")
 
+        advisory = selection.reference_advisory(
+            trials, winner, metric=select_metric
+        )
+
+        if advisory:
+            print(f"        note: {advisory}")
+
         comparisons[horizon] = [trial.record() for trial in trials]
+
+        winner_columns = feature_sets[winner.candidate.feature_set]
+
+        winner_frame = frames[winner.candidate.feature_set]
 
         model = winner.model
 
@@ -337,9 +392,9 @@ def run(
         if refit_full:
             # More recent data at the cost of alpha having been fitted for a
             # model trained on less of it.
-            model = winner.candidate.build()
+            model = winner.candidate.build(horizon_hours)
 
-            model.fit(X, y_absolute - anchor)
+            model.fit(winner_frame, y_absolute - anchor)
 
         models[horizon] = model
 
@@ -362,8 +417,12 @@ def run(
             "family": winner.candidate.family,
             "model_type": type(model).__name__,
             "params": dict(winner.candidate.params),
+            "fitted_params": getattr(model, "fitted_params_", {}) or {},
+            "feature_set": winner.candidate.feature_set,
+            "features": winner_columns,
             "alpha": alpha,
             "reason": reason,
+            "advisory": advisory,
             "notes": winner.notes,
         }
 
@@ -383,7 +442,9 @@ def run(
         # explanation failing is not a reason to fail the retrain.
         try:
             explanations[horizon] = {
-                **global_importance(model, X.iloc[test], FEATURE_COLUMNS),
+                **global_importance(
+                    model, winner_frame.iloc[test], winner_columns
+                ),
                 "explains": "correction applied to the persistence anchor",
             }
 
@@ -406,7 +467,14 @@ def run(
         "trained_at": trained_at.isoformat(timespec="seconds"),
         "city": city.lower(),
         "models": chosen,
+        # The curated list, kept at the top level because that is where
+        # earlier runs recorded it. A horizon's actual columns are on its
+        # entry in "models", since a series model uses the history block
+        # instead.
         "features": FEATURE_COLUMNS,
+        "feature_sets": {
+            name: len(columns) for name, columns in feature_sets.items()
+        },
         "environment": environment_snapshot(),
         "evaluation": {
             "scheme": "chronological, purged, nested",
@@ -427,7 +495,7 @@ def run(
                 "scope": "validation block",
                 "margin": select_margin,
                 "default_model": default_model,
-                "reference_models_eligible": allow_baseline,
+                "reference_models_eligible": allow_reference,
                 "note": (
                     "Candidates were ranked on the validation block only. "
                     "Test metrics are reported for every candidate but took "
@@ -503,7 +571,10 @@ def publish_to_registry(
             model,
             metrics=metadata["metrics"][horizon],
             params=chosen["params"],
-            features=metadata["features"],
+            # This horizon's own columns, not the global list: serving reads
+            # the feature list off the document, so a series model registered
+            # here is loaded with the history block it expects.
+            features=chosen["features"],
             city=metadata["city"],
             horizon=horizon,
             run_id=metadata["run_id"],
@@ -667,12 +738,15 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--allow-baseline",
+        "--allow-reference",
         action="store_true",
         help=(
-            "Let reference candidates such as 'persistence' win a slot. They "
-            "are always evaluated; by default they cannot be selected, "
-            "because a constant model has no SHAP explanation to show"
+            "Let reference and statistical candidates (persistence, "
+            "seasonal_naive, holt_winters, seasonal_ar) win a slot. They are "
+            "always evaluated; by default they cannot be selected, because "
+            "none of them offers per-feature attribution and the dashboard's "
+            "SHAP panel would be empty. Every run reports when excluding them "
+            "cost accuracy"
         ),
     )
 
@@ -758,7 +832,7 @@ def main() -> None:
         select_metric=args.select_metric,
         select_margin=args.select_margin,
         default_model=args.default_model,
-        allow_baseline=args.allow_baseline,
+        allow_reference=args.allow_reference,
     )
 
     if args.metadata_out:

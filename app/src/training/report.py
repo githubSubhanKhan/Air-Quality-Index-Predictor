@@ -88,10 +88,15 @@ def slate_table(candidates: list) -> list:
         validation = entry.get("validation", {})
         test = entry.get("test", {})
 
+        seconds = (
+            entry.get("fit_seconds", 0) or 0
+        ) + (entry.get("predict_seconds", 0) or 0)
+
         rows.append([
             CODE.format(entry.get("candidate", "?")),
             entry.get("family", "-"),
             mark,
+            str(entry.get("feature_count", "-")),
             _number(entry.get("alpha")),
             _number(validation.get("mae")),
             _number(validation.get("rmse")),
@@ -99,17 +104,65 @@ def slate_table(candidates: list) -> list:
             _number(test.get("mae")),
             _number(test.get("rmse")),
             _number(test.get("r2"), 4, signed=True),
-            _number(entry.get("fit_seconds"), 1),
+            _number(seconds, 1),
         ])
 
     return _table(
         [
-            "Candidate", "Family", "", "Alpha",
+            "Candidate", "Family", "", "Features", "Alpha",
             "Val MAE", "Val RMSE", "Val R²",
-            "Test MAE", "Test RMSE", "Test R²", "Fit (s)",
+            "Test MAE", "Test RMSE", "Test R²", "Time (s)",
         ],
         rows,
     )
+
+
+def fitted_parameters(metadata: dict) -> list:
+    """
+    What estimation produced for the candidates that fit parameters of their
+    own — smoothing constants, AR order, stationarity.
+
+    The ML models are omitted: their fitted state is the artifact, not a
+    handful of numbers worth printing. Entries are de-duplicated because these
+    parameters are estimated from the series and do not depend on the horizon,
+    so all three horizons report the same fit.
+    """
+
+    seen = {}
+
+    for entries in metadata.get("candidates", {}).values():
+        for entry in entries:
+            fitted = entry.get("fitted_params") or {}
+
+            if not fitted:
+                continue
+
+            shown = ", ".join(
+                f"{key}={value}"
+                for key, value in fitted.items()
+                # The coefficient vector can be 24 numbers long; it is on the
+                # registry document for anyone who needs it.
+                if key not in ("coefficients", "rejected_orders")
+            )
+
+            seen.setdefault(
+                (entry.get("candidate", "?"), shown),
+                f"- {CODE.format(entry.get('candidate', '?'))} — {shown}",
+            )
+
+    if not seen:
+        return []
+
+    return [
+        "#### Fitted statistical parameters",
+        "",
+        *seen.values(),
+        "",
+        "> Estimated from the training series, so they are shared across the "
+        "three horizons. Full AR coefficient vectors are on the registry "
+        "documents.",
+        "",
+    ]
 
 
 def render(metadata: dict) -> str:
@@ -155,9 +208,12 @@ def render(metadata: dict) -> str:
     ]
 
     for horizon, chosen in metadata.get("models", {}).items():
-        reason = chosen.get("reason", "")
+        lines += [f"- **{horizon}** — {chosen.get('reason', '')}"]
 
-        lines += [f"- **{horizon}** — {reason}"]
+        advisory = chosen.get("advisory")
+
+        if advisory:
+            lines += [f"  - ⚠️ {advisory}"]
 
     lines += [""]
 
@@ -180,9 +236,14 @@ def render(metadata: dict) -> str:
         lines += [
             "> Candidates were ranked on the validation block only. Test "
             "metrics are shown for every candidate but took no part in the "
-            "choice.",
+            "choice. Rows marked *reference* were scored but were not "
+            "eligible for the slot: none of them offers per-feature "
+            "attribution, so promoting one would empty the dashboard's SHAP "
+            "panel.",
             "",
         ]
+
+        lines += fitted_parameters(metadata)
 
     published = registry.get("published", {})
 

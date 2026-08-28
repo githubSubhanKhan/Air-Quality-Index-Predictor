@@ -103,7 +103,14 @@ def _load_from_disk() -> dict:
     for horizon in HORIZONS:
         models[horizon] = joblib.load(_local_artifact(horizon))
 
-        features[horizon] = metadata.get("features") or columns
+        # Per-horizon first: a statistical winner reads the raw history block
+        # rather than the curated feature list, exactly as it does when loaded
+        # from the registry. Older metadata has only the global list.
+        features[horizon] = (
+            chosen.get(horizon, {}).get("features")
+            or metadata.get("features")
+            or columns
+        )
 
         documents[horizon] = {
             "name": f"xgboost_{horizon}",
