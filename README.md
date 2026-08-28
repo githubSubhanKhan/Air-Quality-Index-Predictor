@@ -153,6 +153,37 @@ Order selection **rejects non-stationary fits**: least squares will happily retu
 
 **Still missing from the brief's range:** deep learning (TensorFlow/PyTorch). That is the one remaining model-variety gap.
 
+### ✅ Hazardous AQI alerts (dashboard banner + email)
+The brief asks for "alerts for hazardous AQI levels". Two things now do that, sharing one definition of what "hazardous" means.
+
+**The shared scale.** The six EPA categories, their bounds and their health advice moved into `app/src/features/aqi.py` (`AQI_CATEGORIES`, `categorise`). The dashboard used to own a private copy; it now keeps only the palette and derives the bands from the shared scale, so the badge on screen and the advice in an email can never disagree. A test asserts the two agree band for band.
+
+**On the dashboard.** A sidebar control sets the alert threshold (default *Unhealthy for Sensitive Groups*, 101+ — waiting for 301 would mean the alerts never fire in a city that sits in the 50–150 band). When any of the three days reaches it, a banner appears above the forecast naming the day, the AQI, and what to do; ≥ *Very Unhealthy* escalates it from a warning to an error-styled banner.
+
+**By email.** A "Email This Forecast" section takes an address and mails the 3-day outlook:
+
+- `app/src/alerts/messages.py` — composes subject, plain-text and HTML bodies. Multipart, plain text first, inline-styled HTML (email clients strip `<style>`).
+- `app/src/alerts/mailer.py` — SMTP transport, STARTTLS or SSL by port, credentials read from the environment on every call (never cached at import, or the Streamlit secrets bridge would arrive too late).
+- `app/src/alerts/cli.py` — the same alert from the command line, with `--dry-run` / `--show` to check wording and configuration without mailing anyone, and `--only-if-breach` for a scheduled job that should stay silent on clean days.
+- `app/src/prediction/forecast.py` — the load → engineer → predict → provenance sequence in one place, so the CLI does not re-implement what the dashboard already does.
+
+Details that are deliberate rather than incidental:
+
+- **Every send reports all three days**, and the threshold decides *severity*, not whether there is anything to say. Mail that arrives only on bad days is indistinguishable from a mail system that has quietly broken. The subject reflects which case it is: `AQI alert for Karachi: Hazardous air forecast (312 AQI on Day 3)` versus `Karachi AQI outlook: Moderate (peak 66 AQI over 3 days)`.
+- **The reading time is on the face of the message**, because the forecast is anchored on the most recent *complete* feature row, which is not always the most recent reading (see below).
+- **Health advice comes from the worst of the three days**, not the first.
+- **Model provenance is in the footer** — which registry version and its MAE, per horizon.
+- **Guard rails**: the recipient address is validated and length-capped before any connection is opened, and a session is limited to 5 sends with a 45-second cooldown. The dashboard is public once deployed and the button mails an arbitrary address.
+- **No unauthenticated API route.** An open `POST /alerts` endpoint is a spam relay, so the send path is deliberately only the dashboard and the CLI.
+- Failure modes are separate exceptions (`AlertConfigError`, `AlertAddressError`, `AlertSendError`) with messages written for whoever is looking at the screen — a Gmail auth rejection is translated into the App Password instructions rather than surfaced as `(535, b'...')`.
+
+No new dependencies: `smtplib`, `ssl` and `email` are standard library.
+
+### ⚠️ Known issue: the forecast can be anchored on a stale reading
+The hourly feature pipeline is not running hourly — recent readings are 3–11 hours apart, and `missing_hourly_rows` is 341 and climbing. Because the lag features (`aqi_lag_1` and friends) are not gap-tolerant, the newest usable row can be most of a day behind the newest reading, and the dashboard's "Current Air Quality Index" is that row.
+
+This is now **surfaced rather than hidden**: the dashboard prints what the forecast is anchored on and escalates to a warning past 24 hours old, and the same timestamp is on every alert email. The underlying fix — gap-tolerant lag features, or having the workflow backfill missed hours on each run — is still outstanding.
+
 The registry slot names (`aqi_xgboost_day1`, …) are deliberately unchanged: version numbers, promotion history and rollback are keyed on them, so renaming per family would restart numbering and leave the promotion gate with no incumbent. The `candidate`, `model_family` and `model_type` fields on each document say what is actually inside.
 - Guardrails: refuses to train on fewer than `--min-rows` usable rows (default 500), and scores every horizon against a **persistence baseline** (assume the next three days look like now) so a horizon that adds no value is visible in the metrics.
 - Alongside the `.pkl` files it writes `app/models/training_metadata.json` — trained-at timestamp, city, hyperparameters, row counts, data range, missing hourly rows, and MAE / RMSE / R² (plus baseline R²) per horizon.
@@ -242,7 +273,7 @@ Two things worth saying plainly, since the skill column sits close to zero:
 
 ### 🔜 Phase 4 — Forecasting + API
 - [x] ~~72-hour forecasting~~ — three independent XGBoost models predicting the mean AQI for day 1 / day 2 / day 3, each as a damped correction to persistence. Day 1 R² +0.86 → Day 3 R² +0.26 after the day-3 rework.
-- [ ] AQI category classification (Good / Moderate / Unhealthy / Hazardous) with colour codes.
+- [x] ~~AQI category classification (Good / Moderate / Unhealthy / Hazardous) with colour codes~~ — the six EPA categories now live in `app/src/features/aqi.py` with health advice, shared by the dashboard and the alerts.
 - [ ] Wire the trained models into the FastAPI app — `app/main.py` / `app/routes/` still only expose the root and `/health` routes; no inference endpoint exists yet.
 - [ ] New endpoints:
   - `GET /predict` — current AQI, category, 3-day forecast, last 24h history, model metadata
@@ -259,7 +290,8 @@ Two things worth saying plainly, since the skill column sits close to zero:
 - [ ] Deploy the API and dashboard (e.g. Render) and document the live URLs.
 
 ### 🔜 Phase 7 — Engineering hygiene
-- [ ] Add `.env.example`, tests for `aqi.py` / `build_features.py`, and logging in place of `print`.
+- [x] ~~Add `.env.example`~~ — added, documenting every variable including the email-alert block.
+- [ ] Tests for `aqi.py` / `build_features.py`, and logging in place of `print`.
 - [x] `requirements.txt` now lists `scikit-learn`, `xgboost`, `joblib` and `numpy`, which the retraining pipeline needs in CI (`lightgbm` is still notebook-only).
 - [x] ~~Add `shap`, `plotly`, `streamlit` to `requirements.txt`~~ — all three are pinned.
 - [ ] Remove the vendored `Affan Project/` reference repo from the working tree before final submission.
@@ -294,7 +326,8 @@ Air-Quality-Index-Predictor/
 │           └── backfill.py           # Historical backfill (CLI)
 │       ├── prediction/
 │       │   ├── build_prediction_features.py   # Latest feature row for serving
-│       │   └── predictor.py                   # Loads the .pkl models, returns the 3-day forecast
+│       │   ├── forecast.py                    # City -> forecast + reading time + provenance
+│       │   └── predictor.py                   # Loads the production models, returns the 3-day forecast
 │       ├── training/
 │       │   ├── train.py              # Daily retraining pipeline (CLI)
 │       │   ├── candidates.py         # Candidate model slate (reference / statistical / ML)
@@ -304,13 +337,18 @@ Air-Quality-Index-Predictor/
 │       ├── registry/
 │       │   ├── model_registry.py     # MongoDB/GridFS model registry
 │       │   └── cli.py                # Registry CLI (list/show/promote/rollback/prune)
-│       └── explain/
-│           └── explainer.py          # SHAP explanations (local + global)
+│       ├── explain/
+│       │   └── explainer.py          # SHAP explanations (local + global)
+│       └── alerts/
+│           ├── messages.py           # Composes the 3-day alert (subject/text/HTML)
+│           ├── mailer.py             # SMTP transport + config validation
+│           └── cli.py                # Send an alert from the command line
 ├── .github/workflows/
 │   ├── data_pipeline.yml             # Hourly feature pipeline
 │   └── daily_training.yml            # Daily model retraining
 ├── data/                             # Local CSV cache (git-ignored)
 ├── requirements.txt
+├── .env.example                      # Template for .env (tracked)
 ├── .env                              # Secrets (git-ignored)
 └── README.md
 ```
@@ -357,14 +395,26 @@ pip install lightgbm
 
 ### Environment variables
 
-Create a `.env` file in the project root:
+Copy `.env.example` to `.env` and fill it in:
 
 ```
-WAQI_API_KEY=your_waqi_token
-OPENWEATHER_API_KEY=your_openweather_key
+# Feature store + model registry (one MongoDB database holds both)
 MONGODB_URI=your_mongodb_connection_string
 MONGODB_DB_NAME=aqi_predictor
+
+# Data sources
+OPENWEATHER_API_KEY=your_openweather_key
+WAQI_API_KEY=your_waqi_token
+
+# Email alerts — the account alerts are sent *from*
+ALERT_SENDER_EMAIL=your_sender_address
+ALERT_SENDER_PASSWORD=your_app_password
+ALERT_SENDER_NAME=AQI Predictor
+ALERT_SMTP_HOST=smtp.gmail.com
+ALERT_SMTP_PORT=587
 ```
+
+> **Gmail senders:** `ALERT_SENDER_PASSWORD` must be a 16-character **App Password**, not the account password — Google stopped accepting password sign-in for SMTP. Create one under *Google account → Security → 2-Step Verification → App passwords* (2-Step Verification has to be enabled first). Port 587 uses STARTTLS; 465 switches to implicit SSL. When deployed on Streamlit Cloud, put the same keys in the app's **Secrets** — `streamlit_app.py` bridges them into `os.environ` before any module reads them.
 
 ### Usage
 
@@ -399,6 +449,11 @@ python -m app.src.training.train --default-model random_forest        # change t
 # Render a run's candidate comparison as Markdown (what CI puts in the job summary)
 python -m app.src.training.train --city karachi --no-publish --metadata-out run.json
 python -m app.src.training.report run.json
+
+# Email a city's 3-day AQI alert
+python -m app.src.alerts.cli --city karachi --to you@example.com --show     # compose only
+python -m app.src.alerts.cli --city karachi --to you@example.com            # send
+python -m app.src.alerts.cli --city karachi --to you@example.com     --threshold 151 --only-if-breach                                        # for a cron job
 
 # Inspect the model registry
 python -m app.src.registry.cli list
@@ -475,6 +530,8 @@ jupyter notebook app/notebooks/lag_feature_engineering_3_days.ipynb   # 3-day da
 | Automated model selection per retrain (8-candidate slate, validation-ranked) | ✅ Done — Day 1 skill vs persistence −0.025 → +0.007, Day 3 R² 0.275 → 0.315 |
 | Statistical forecasting models (seasonal naive, Holt-Winters ETS, seasonal AR) | ✅ Done — fitted, backtested and servable; `seasonal_ar` has the best Day-1 test MAE on the slate |
 | Deep learning models (TensorFlow / PyTorch) | 🔜 Pending |
+| Hazardous-AQI alerts (dashboard banner + email, shared EPA scale) | ✅ Done — threshold control, health advice, session rate limits, CLI |
+| Gap-tolerant lag features (forecast can lag the newest reading) | 🔜 Pending — now surfaced in the UI and in every alert |
 | Day-wise 3-day forecasting (per-horizon model, selected per retrain) | ✅ Done |
 | Day-3 accuracy rework (negative R² fixed) | ✅ Done — Day 3 R² -0.03 → +0.26, all horizons positive |
 | Data quality fixes (AQI definition, dedup, etc.) | 🔜 Pending |

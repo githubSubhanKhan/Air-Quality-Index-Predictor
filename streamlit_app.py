@@ -1,37 +1,74 @@
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# Streamlit Cloud secrets live in st.secrets, but feature_store.py (and dotenv)
-# read from os.environ — bridge them before any DB-touching import runs.
-# Locally there's no secrets.toml at all, which makes st.secrets raise, so
-# this is a no-op there and feature_store.py's own load_dotenv() takes over.
+# Streamlit Cloud secrets live in st.secrets, but feature_store.py and
+# alerts/mailer.py (and dotenv) read from os.environ — bridge them before any
+# module that reads them is imported. Locally there's no secrets.toml at all,
+# which makes st.secrets raise, so this is a no-op there and the modules' own
+# load_dotenv() takes over.
 try:
-    for _key in ("MONGODB_URI", "MONGODB_DB_NAME"):
+    for _key in (
+        "MONGODB_URI",
+        "MONGODB_DB_NAME",
+        "ALERT_SENDER_EMAIL",
+        "ALERT_SENDER_PASSWORD",
+        "ALERT_SMTP_HOST",
+        "ALERT_SMTP_PORT",
+        "ALERT_SENDER_NAME",
+    ):
         if _key in st.secrets:
-            os.environ[_key] = st.secrets[_key]
+            os.environ[_key] = str(st.secrets[_key])
 except Exception:
     pass
 
+from app.src.alerts.mailer import (
+    AlertError,
+    is_configured as alerts_configured,
+    send_alert,
+    sender_hint,
+    valid_address,
+)
+from app.src.features.aqi import (
+    AQI_CATEGORIES,
+    DEFAULT_ALERT_THRESHOLD,
+    categorise,
+    threshold_categories,
+)
 from app.src.features.feature_store import get_collection
 from app.src.prediction.build_prediction_features import build_prediction_features
 from app.src.explain.explainer import explain_prediction
 from app.src.prediction.predictor import model_info
 from app.src.prediction.predictor import predict as predict_aqi
 
-# "Very Unhealthy"/"Hazardous" extend the palette's 4-step status scale to
-# match the 6-category EPA AQI standard users expect.
+# Colours for the six EPA categories. The bands themselves come from
+# app/src/features/aqi.py so the dashboard, the email alerts and the health
+# advice cannot drift apart; only the palette lives here, because it is tuned
+# for this screen.
+CATEGORY_COLOURS = {
+    "Good": "#0ca30c",
+    "Moderate": "#fab219",
+    "Unhealthy for Sensitive Groups": "#ec835a",
+    "Unhealthy": "#d03b3b",
+    "Very Unhealthy": "#4a3aa7",
+    "Hazardous": "#6b1414",
+}
+
 AQI_SCALE = [
-    (0, 50, "Good", "#0ca30c"),
-    (51, 100, "Moderate", "#fab219"),
-    (101, 150, "Unhealthy for Sensitive Groups", "#ec835a"),
-    (151, 200, "Unhealthy", "#d03b3b"),
-    (201, 300, "Very Unhealthy", "#4a3aa7"),
-    (301, 500, "Hazardous", "#6b1414"),
+    (category.low, category.high, category.label, CATEGORY_COLOURS[category.label])
+    for category in AQI_CATEGORIES
 ]
+
+# Guard rails on the send button. The dashboard is public once deployed and
+# the button mails an arbitrary address, so a single session cannot be used to
+# hose someone's inbox.
+ALERT_COOLDOWN_SECONDS = 45
+
+ALERT_MAX_PER_SESSION = 5
 
 THEME = dict(
     surface="#fcfcfb", card_bg="#f2f1ed",
@@ -143,7 +180,23 @@ def fetch_prediction(city):
 
     df = pd.DataFrame(records)
     features = build_prediction_features(df)
+
+    if features.empty:
+        return {
+            "error": (
+                f"No complete feature row for '{city}' — the recent history "
+                f"has gaps the engineered features cannot be built from."
+            )
+        }
+
     forecast = predict_aqi(features)
+
+    # The row the forecast is anchored on, which is the most recent *complete*
+    # one and not necessarily the most recent reading. Surfaced so a stale
+    # forecast is visible rather than presented as current.
+    reading_time = pd.to_datetime(
+        features["timestamp"].iloc[0], utc=True
+    ).to_pydatetime()
 
     # Explained from the same feature row the forecast came from, so the
     # contributions always match the numbers on screen.
@@ -153,7 +206,12 @@ def fetch_prediction(city):
         print(f"Could not explain the forecast: {exc}")
         explanation = None
 
-    return {"city": city, "forecast": forecast, "explanation": explanation}
+    return {
+        "city": city,
+        "forecast": forecast,
+        "reading_time": reading_time,
+        "explanation": explanation,
+    }
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -556,6 +614,176 @@ def render_model_provenance(info):
             st.caption(f"Trained: {trained_at}")
 
 
+def breaching_days(forecast, threshold):
+    """The forecast days at or above the alert threshold, worst first."""
+
+    days = [
+        (f"Day {index}", forecast[f"day_{index}"])
+        for index in (1, 2, 3)
+        if forecast.get(f"day_{index}") is not None
+        and forecast[f"day_{index}"] >= threshold
+    ]
+
+    return sorted(days, key=lambda day: day[1], reverse=True)
+
+
+def render_alert_banner(forecast, threshold):
+    """
+    The in-dashboard alert. Shown only when the forecast actually breaches.
+
+    Severity follows the EPA category rather than the threshold, so the wording
+    matches the advice: anything from "Very Unhealthy" up is an error-level
+    banner, the milder bands are a warning.
+    """
+
+    breaches = breaching_days(forecast, threshold)
+
+    if not breaches:
+        return
+
+    label, value = breaches[0]
+
+    category = categorise(value)
+
+    when = ", ".join(day for day, _ in sorted(breaches, key=lambda d: d[0]))
+
+    message = (
+        f"**{category.label} air forecast — {label} reaches {value:.0f} AQI.** "
+        f"{category.headline} {category.advice}"
+        f"\n\nDays at or above {threshold} AQI: {when}."
+    )
+
+    if category.index >= 4:
+        st.error(message, icon="🚨")
+    else:
+        st.warning(message, icon="⚠️")
+
+
+def _alert_gate():
+    """
+    Whether a send is allowed right now. Returns ``(allowed, message)``.
+
+    Purely per-session: it stops a stray double-click and casual misuse of a
+    public dashboard, and is not a substitute for real rate limiting if this
+    ever gets a public API.
+    """
+
+    sent = st.session_state.get("alert_send_count", 0)
+
+    if sent >= ALERT_MAX_PER_SESSION:
+        return False, (
+            f"You have sent {sent} alerts from this session, which is the "
+            f"limit. Reload the page to send more."
+        )
+
+    last = st.session_state.get("alert_last_sent")
+
+    if last is not None:
+        waited = time.monotonic() - last
+
+        if waited < ALERT_COOLDOWN_SECONDS:
+            return False, (
+                f"Just a moment — you can send another alert in "
+                f"{ALERT_COOLDOWN_SECONDS - waited:.0f}s."
+            )
+
+    return True, ""
+
+
+def render_email_alerts(city, forecast, reading_time, threshold, model_details):
+    """Email this forecast to an address the visitor types in."""
+
+    st.subheader("Email This Forecast")
+
+    if not alerts_configured():
+        st.info(
+            "Email alerts are switched off because no sender account is "
+            "configured. Set `ALERT_SENDER_EMAIL` and "
+            "`ALERT_SENDER_PASSWORD` in `.env` (or in Streamlit secrets when "
+            "deployed) and reload. For a Gmail sender the password must be a "
+            "16-character **App Password**, not the account password.",
+            icon="✉️",
+        )
+        return
+
+    breaches = breaching_days(forecast, threshold)
+
+    st.caption(
+        f"Sends the 3-day forecast for **{city.title()}** with health "
+        f"guidance, flagging any day at or above **{threshold} AQI** "
+        f"({categorise(threshold).label}). "
+        + (
+            f"Right now {len(breaches)} of the 3 days would be flagged."
+            if breaches
+            else "Right now no day would be flagged."
+        )
+    )
+
+    with st.form("email_alert", clear_on_submit=False):
+        column, button = st.columns([3, 1])
+
+        address = column.text_input(
+            "Email address",
+            placeholder="you@example.com",
+            label_visibility="collapsed",
+        )
+
+        submitted = button.form_submit_button(
+            "Send alert", use_container_width=True, type="primary"
+        )
+
+    if not submitted:
+        return
+
+    if not valid_address(address):
+        st.error("Please enter a valid email address.", icon="✉️")
+        return
+
+    allowed, reason = _alert_gate()
+
+    if not allowed:
+        st.warning(reason, icon="⏳")
+        return
+
+    try:
+        with st.spinner(f"Sending to {address.strip()}…"):
+            result = send_alert(
+                recipient=address,
+                city=city,
+                forecast=forecast,
+                reading_time=reading_time,
+                threshold=threshold,
+                model_details=model_details,
+            )
+
+    except AlertError as exc:
+        # Config, address and SMTP failures all carry a message written to be
+        # read by whoever is looking at the screen.
+        st.error(str(exc), icon="🚫")
+        return
+
+    except Exception as exc:
+        st.error(f"Unexpected problem sending the alert: {exc}", icon="🚫")
+        return
+
+    st.session_state["alert_send_count"] = (
+        st.session_state.get("alert_send_count", 0) + 1
+    )
+    st.session_state["alert_last_sent"] = time.monotonic()
+
+    st.success(
+        f"Sent to **{result['recipient']}** from {result['sender']}."
+        + (
+            f" Flagged: {', '.join(result['breaches'])}."
+            if result["breaches"]
+            else " No day was above your threshold, so it went as an outlook."
+        ),
+        icon="✅",
+    )
+
+    st.caption(f"Subject: {result['subject']}")
+
+
 def main():
     st.set_page_config(page_title="AQI Predictor", page_icon="🌫️", layout="wide")
 
@@ -575,6 +803,29 @@ def main():
             value="7 days",
         )
         history_hours = {"24h": 24, "3 days": 72, "7 days": 168, "30 days": 720}[history_range]
+
+        threshold_labels = {
+            f"{category.label} ({category.low}+)": category.low
+            for category in threshold_categories()
+        }
+
+        default_label = next(
+            label
+            for label, value in threshold_labels.items()
+            if value == DEFAULT_ALERT_THRESHOLD
+        )
+
+        alert_threshold = threshold_labels[
+            st.selectbox(
+                "Alert when AQI reaches",
+                options=list(threshold_labels),
+                index=list(threshold_labels).index(default_label),
+                help=(
+                    "Drives both the banner on this page and which days the "
+                    "emailed forecast flags."
+                ),
+            )
+        ]
 
         if st.button("🔄 Refresh now", use_container_width=True):
             fetch_prediction.clear()
@@ -605,6 +856,30 @@ def main():
 
     forecast = prediction["forecast"]
     current_aqi = forecast["current_aqi"]
+    reading_time = prediction.get("reading_time")
+
+    if reading_time is not None:
+        age_hours = (
+            datetime.now(timezone.utc) - reading_time
+        ).total_seconds() / 3600
+
+        stamp = (
+            f"Anchored on the reading at "
+            f"{reading_time:%Y-%m-%d %H:%M} UTC ({age_hours:.0f}h ago)"
+        )
+
+        # Past a day old the forecast is not describing today any more, and
+        # the reader deserves to know before acting on it.
+        if age_hours >= 24:
+            st.warning(
+                f"{stamp}. The hourly feature pipeline has missed runs, so "
+                f"this is the most recent row with a complete feature set.",
+                icon="🕒",
+            )
+        else:
+            st.caption(stamp)
+
+    render_alert_banner(forecast, alert_threshold)
 
     hero_col, weather_col = st.columns([1.3, 1])
     with hero_col:
@@ -630,6 +905,14 @@ def main():
     st.subheader("3-Day Forecast")
     render_forecast_cards(forecast)
     render_forecast_chart(current_aqi, forecast, t)
+
+    render_email_alerts(
+        city,
+        forecast,
+        reading_time,
+        alert_threshold,
+        (fetch_model_info() or {}).get("horizons"),
+    )
 
     st.subheader("Why This Forecast?")
     st.caption(
