@@ -2,7 +2,7 @@ venv/
 __pycache__/
 *.pyc
 .env
-*.pdf
+AQI_predict-1.pdf
 /data/
 
 Affan*/
