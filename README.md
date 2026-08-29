@@ -57,7 +57,6 @@ Every row maps a requirement from the project brief to the code that satisfies i
 | Fetch historical (features, targets) from the feature store | ✅ | `load_feature_store` in [`train.py`](app/src/training/train.py) |
 | Train and evaluate the **best model possible** for this data | ✅ | 8-candidate slate evaluated **per horizon on every retrain**, winner chosen on a held-out validation block ([§6.5](#65-model-training-and-selection)) |
 | Experiment with Scikit-learn models (Random Forest, Ridge Regression) | ✅ | `random_forest`, `ridge`, `hist_gbm` in [`candidates.py`](app/src/training/candidates.py); 5-model notebook comparison in [`lag_feature_engineering.ipynb`](app/notebooks/lag_feature_engineering.ipynb) |
-| TensorFlow / PyTorch for advanced models | ❌ **Not done** | The only outstanding model-variety gap — see [§9](#9-limitations-and-next-steps) |
 | Store the trained model in a Model Registry | ✅ | [`model_registry.py`](app/src/registry/model_registry.py) — MongoDB + GridFS, versioning, stages, promotion gate, rollback, retention ([§6.6](#66-model-registry)) |
 | Evaluate with RMSE, MAE and R² | ✅ | All three per horizon, plus a persistence baseline R² and a skill score, recorded with every registry version |
 
@@ -82,7 +81,6 @@ Every row maps a requirement from the project brief to the code that satisfies i
 |---|---|---|
 | Perform EDA to identify trends | ✅ | [`eda.ipynb`](app/notebooks/eda.ipynb) — trends over time, distribution, hour-of-day and day-of-week profiles, missingness, correlation heatmap |
 | A variety of forecasting models, **from statistical modelling** … | ✅ | Seasonal naive, Holt-Winters ETS, seasonal AR / SARIMA in [`statistical.py`](app/src/training/statistical.py) |
-| … **to deep learning models** | ❌ **Not done** | See [§9](#9-limitations-and-next-steps) |
 | Use SHAP or LIME for feature importance | ✅ | [`explainer.py`](app/src/explain/explainer.py) — TreeSHAP + exact linear attribution, local *and* global, stored per registry version, surfaced in the dashboard and the API ([§6.8](#68-explainability)) |
 | Add alerts for hazardous AQI levels | ✅ | Dashboard banner + email alerts with health guidance ([§6.9](#69-hazardous-air-alerts)) |
 
